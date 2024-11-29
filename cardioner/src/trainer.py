@@ -2,7 +2,7 @@ from os import environ
 import spacy
 
 # Load a spaCy model for tokenization
-nlp = spacy.blank("nl")
+# nlp = spacy.blank("es")
 environ["WANDB_MODE"] = "disabled"
 environ["WANDB_DISABLED"] = "true"
 
@@ -77,10 +77,10 @@ class CustomDataCollatorForTokenClassification(DataCollatorForTokenClassificatio
     
 class ModelTrainer():
     def __init__(self,
+                model: str,
                  label2id: Dict[str, int],
                  id2label: Dict[int, str],
                  tokenizer=None,
-                 model: str='CLTL/MedRoBERTa.nl',
                  batch_size: int=48,
                  max_length: int=514,
                  learning_rate: float=1e-4,
@@ -130,7 +130,7 @@ class ModelTrainer():
 
 
         self.args = TrainingArguments(
-            output_dir=r""+output_dir,
+            output_dir=output_dir,
             **self.train_kwargs
         )
 
@@ -150,6 +150,8 @@ class ModelTrainer():
             [id2label[p] for (p, l) in zip(prediction, label) if l != -100]
             for prediction, label in zip(predictions, labels)
         ]
+        # print("True labels:", true_labels)
+        # print("Predictions:", true_predictions)
         all_metrics = metric.compute(predictions=true_predictions, references=true_labels)
         return {
             "precision": all_metrics["overall_precision"],
@@ -172,9 +174,10 @@ class ModelTrainer():
         trainer.train()
         metrics = trainer.evaluate()
         try:
-            trainer.save_model(r""+self.output_dir)
-            trainer.save_metrics(r""+self.output_dir, metrics=metrics)
-        except:
+            trainer.save_model(self.output_dir)
+            trainer.save_metrics(self.output_dir, metrics=metrics)
+        except Exception as e:
+            print(e)
             print("Failed to save model and metrics")
         torch.cuda.empty_cache()
         return True
