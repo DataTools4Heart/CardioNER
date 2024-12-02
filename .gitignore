@@ -1,5 +1,5 @@
-assets_old/
-assets/
+assets/*
+!assets/splits.json
 output/
 .idea/
 bash_jobs/job_training.sh
