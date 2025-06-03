@@ -347,7 +347,7 @@ def evaluate(model_checkpoint, revision, root_path, lang, cat):
                     "ann_id": "NA",
                     "start_span": prd["start"],
                     "end_span": prd["end"],
-                    "text": prd["text"],
+                    "text": prd["text"].replace("\n", " ").replace("\t", " ")
                 })
         # break 
 
