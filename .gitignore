@@ -6,3 +6,10 @@ wandb/
 .DS_Store
 *.tsv
 *.env
+*.parquet
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.zip
+*.tar.gz

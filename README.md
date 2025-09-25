@@ -1,16 +1,21 @@
 # CardioNER.nl
 
 We develop a NER-model for the cardiology domain based on manually annotated translated documents as part of a multilingual NLP-effort.
-We use different models, for each language a BERT/(XLM-)RoBERTa/DeBERTa type model that is finetuned on the labeled NER-corpora.
+The model is validated on original Dutch EHR documents from the Amsterdam UMC.
+
+We use different models, for each language a BERT/RoBERTa/DeBERTa type model that
+
 
 For the base-models we have 2 basic refinements beyond the vanilla finetuning:
 * Adding a CRF to the head: a conditional random field can help in 'respecting' the IOB tag order.
 * self-aligned pre-training (sap) on UMLS term/synonym pairs. Alternatives are BIOSYN, KRISSBERT, BioLord, MirrorBERT.
 
 CardioNER.[lang] will then have 3 version:
-* **v1**: multi-label, multi-class, finetuning of the pre-trained biomedical model 
-* **v2**: we add a custom, more expressive heads 
-* **v3**: we add a multihead CRF
+* **v1**: finetuning of pre-trained biomedical model
+* **v2**: finetuning of pre-trained biomedical model, that is further pre-trained using self-aligned pre-training on UMLS
+* **v3**: we add a CRF head.
+* **v4**: we add multihead CRF compatible with the transformer library
+* **v5**: we add custom heads 
 
 
 # Data structure
