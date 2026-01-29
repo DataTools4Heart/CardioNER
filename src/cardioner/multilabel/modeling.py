@@ -1,10 +1,16 @@
-from transformers import PreTrainedModel, RobertaConfig
-from transformers.modeling_outputs import TokenClassifierOutput
-from transformers import AutoModel, AutoConfig
+import inspect
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Union
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    DebertaV2Config,
+    PreTrainedModel,
+    RobertaConfig,
+)
+from transformers.modeling_outputs import TokenClassifierOutput
 
 
 class MultiLabelTokenClassificationModelCustom(PreTrainedModel):
@@ -12,53 +18,72 @@ class MultiLabelTokenClassificationModelCustom(PreTrainedModel):
     Custom multi-label token classification model with configurable classifier head.
     This model can be loaded with trust_remote_code=True for HuggingFace Hub compatibility.
     """
-    config_class = RobertaConfig
-    def __init__(self, config,
-                 base_model=None,
-                 freeze_backbone=False,
-                 classifier_hidden_layers=None,
-                 classifier_dropout=0.1):
-        super().__init__(config)
 
+    # Supports BERT, RoBERTa, and DeBERTa(V2) models
+
+    # config_class = RobertaConfig
+
+    def __init__(
+        self,
+        config,
+        base_model=None,
+        freeze_backbone=False,
+        classifier_hidden_layers=None,
+        classifier_dropout=0.1,
+    ):
+        super().__init__(config)
+        self.__class__.config_class = config.__class__
         self.config = config
         self.num_labels = config.num_labels
 
         # READ FROM CONFIG (critical)
-        freeze_backbone = getattr(config, 'freeze_backbone', False)
-        classifier_hidden_layers = getattr(config, 'classifier_hidden_layers', None)
-        classifier_dropout = getattr(config, 'classifier_dropout', 0.1)
+        freeze_backbone = getattr(config, "freeze_backbone", False)
+        classifier_hidden_layers = getattr(config, "classifier_hidden_layers", None)
+        classifier_dropout = getattr(config, "classifier_dropout", 0.1)
 
         # If base_model is not provided, load it from config
+        # modeling.py
         if base_model is None:
-            self.roberta = AutoModel.from_config(config=config)
+            name = getattr(config, "name_or_path", None)
+            if name is None:
+                raise ValueError(
+                    "config.name_or_path is required to load pretrained backbone"
+                )
+            self.backbone = AutoModel.from_pretrained(
+                name, config=config
+            )  # ← use pretrained
         else:
-            self.roberta = base_model
+            self.backbone = base_model
 
         # Access custom attributes correctly
-        self.lm_output_size = self.roberta.config.hidden_size
+        self.lm_output_size = self.backbone.config.hidden_size
         # Store configuration for saving/loading
         self.config.freeze_backbone = freeze_backbone
         self.config.classifier_hidden_layers = classifier_hidden_layers
         self.config.classifier_dropout = classifier_dropout
 
         if freeze_backbone:
-            #print("+" * 30, "\n\n", "Freezing backbone...", "+" * 30, "\n\n")
-            for param in self.roberta.parameters():
+            # print("+" * 30, "\n\n", "Freezing backbone...", "+" * 30, "\n\n")
+            for param in self.backbone.parameters():
                 param.requires_grad = False
-            self.roberta.eval()
+            self.backbone.eval()
         else:
-            self.roberta.train(True)
+            self.backbone.train(True)
 
-        self.dropout = nn.Dropout(config.hidden_dropout_prob if hasattr(config, 'hidden_dropout_prob') else 0.1)
+        self.dropout = nn.Dropout(
+            config.hidden_dropout_prob
+            if hasattr(config, "hidden_dropout_prob")
+            else 0.1
+        )
         self._build_classifier_head(classifier_hidden_layers, classifier_dropout)
 
     @classmethod
     def from_config(cls, config):
         return cls(
             config=config,
-            freeze_backbone=getattr(config, 'freeze_backbone', False),
-            classifier_hidden_layers=getattr(config, 'classifier_hidden_layers', None),
-            classifier_dropout=getattr(config, 'classifier_dropout', 0.1),
+            freeze_backbone=getattr(config, "freeze_backbone", False),
+            classifier_hidden_layers=getattr(config, "classifier_hidden_layers", None),
+            classifier_dropout=getattr(config, "classifier_dropout", 0.1),
         )
 
     def _build_classifier_head(self, hidden_layers, dropout_rate):
@@ -76,8 +101,7 @@ class MultiLabelTokenClassificationModelCustom(PreTrainedModel):
         # If hidden_layers is None or empty, just create a simple linear layer
         if not hidden_layers:
             self.classifier = nn.Sequential(
-                nn.Dropout(dropout_rate),
-                nn.Linear(input_size, self.num_labels)
+                nn.Dropout(dropout_rate), nn.Linear(input_size, self.num_labels)
             )
             return
 
@@ -106,22 +130,34 @@ class MultiLabelTokenClassificationModelCustom(PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **kwargs
+        **kwargs,
     ) -> Union[Tuple[torch.Tensor], TokenClassifierOutput]:
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.roberta(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
         )
+
+        forward_kwargs = {
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+            "head_mask": head_mask,
+        }
+
+        # Remove head_mask for DeBERTa models as they don't support it
+        # Filter by the backbone's actual signature and skip Nones
+        sig = inspect.signature(
+            getattr(self.backbone, "forward", self.backbone.__call__)
+        )
+        allowed = sig.parameters.keys()
+        forward_kwargs = {
+            k: v for k, v in forward_kwargs.items() if k in allowed and v is not None
+        }
+
+        outputs = self.backbone(input_ids, **forward_kwargs)
 
         sequence_output = outputs[0]
         sequence_output = self.dropout(sequence_output)
@@ -134,7 +170,9 @@ class MultiLabelTokenClassificationModelCustom(PreTrainedModel):
             # Create mask for valid labels (not -100)
             mask = (labels != -100).float()
             # Replace -100 with 0 for loss computation
-            labels_masked = torch.where(labels == -100, torch.zeros_like(labels), labels)
+            labels_masked = torch.where(
+                labels == -100, torch.zeros_like(labels), labels
+            )
             # Compute loss only on valid positions
             loss_tensor = loss_fct(logits, labels_masked.float())
             loss = (loss_tensor * mask).sum() / mask.sum()
@@ -224,16 +262,21 @@ def load_custom_cardioner_model(model_path: str, device: str = "auto"):
     Returns:
         tuple: (model, tokenizer, config)
     """
-    from transformers import AutoTokenizer, AutoModelForTokenClassification
-    import torch
-
     # Validate model directory
     import os
+
+    import torch
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+
     required_files = ["config.json", "modeling.py", "pytorch_model.bin"]
-    missing_files = [f for f in required_files if not os.path.exists(os.path.join(model_path, f))]
+    missing_files = [
+        f for f in required_files if not os.path.exists(os.path.join(model_path, f))
+    ]
 
     if missing_files:
-        raise FileNotFoundError(f"Missing required files in {model_path}: {missing_files}")
+        raise FileNotFoundError(
+            f"Missing required files in {model_path}: {missing_files}"
+        )
 
     print(f"Loading custom CardioNER model from: {model_path}")
 
@@ -242,8 +285,7 @@ def load_custom_cardioner_model(model_path: str, device: str = "auto"):
 
     # Load model with trust_remote_code=True
     model = AutoModelForTokenClassification.from_pretrained(
-        model_path,
-        trust_remote_code=True
+        model_path, trust_remote_code=True
     )
 
     # Set device
@@ -269,29 +311,29 @@ def validate_custom_model_directory(model_path: str) -> dict:
     Returns:
         dict: Validation results with status and details
     """
-    import os
     import json
+    import os
 
     validation_results = {
         "valid": True,
         "errors": [],
         "warnings": [],
         "files_found": [],
-        "model_info": {}
+        "model_info": {},
     }
 
     # Required files
     required_files = {
         "config.json": "Model configuration",
         "modeling.py": "Custom model class definition",
-        "pytorch_model.bin": "Model weights"
+        "pytorch_model.bin": "Model weights",
     }
 
     # Optional files
     optional_files = {
         "tokenizer.json": "Tokenizer vocabulary",
         "tokenizer_config.json": "Tokenizer configuration",
-        "training_args.json": "Training arguments"
+        "training_args.json": "Training arguments",
     }
 
     # Check required files
@@ -301,7 +343,9 @@ def validate_custom_model_directory(model_path: str) -> dict:
             validation_results["files_found"].append(f"{filename} ({description})")
         else:
             validation_results["valid"] = False
-            validation_results["errors"].append(f"Missing required file: {filename} - {description}")
+            validation_results["errors"].append(
+                f"Missing required file: {filename} - {description}"
+            )
 
     # Check optional files
     for filename, description in optional_files.items():
@@ -309,23 +353,35 @@ def validate_custom_model_directory(model_path: str) -> dict:
         if os.path.exists(filepath):
             validation_results["files_found"].append(f"{filename} ({description})")
         else:
-            validation_results["warnings"].append(f"Missing optional file: {filename} - {description}")
+            validation_results["warnings"].append(
+                f"Missing optional file: {filename} - {description}"
+            )
 
     # Parse config if available
     config_path = os.path.join(model_path, "config.json")
     if os.path.exists(config_path):
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config = json.load(f)
 
-            validation_results["model_info"]["num_labels"] = config.get("num_labels", "Unknown")
-            validation_results["model_info"]["model_type"] = config.get("model_type", "Unknown")
+            validation_results["model_info"]["num_labels"] = config.get(
+                "num_labels", "Unknown"
+            )
+            validation_results["model_info"]["model_type"] = config.get(
+                "model_type", "Unknown"
+            )
             validation_results["model_info"]["has_auto_map"] = "auto_map" in config
-            validation_results["model_info"]["classifier_hidden_layers"] = config.get("classifier_hidden_layers", None)
-            validation_results["model_info"]["freeze_backbone"] = config.get("freeze_backbone", None)
+            validation_results["model_info"]["classifier_hidden_layers"] = config.get(
+                "classifier_hidden_layers", None
+            )
+            validation_results["model_info"]["freeze_backbone"] = config.get(
+                "freeze_backbone", None
+            )
 
             if not config.get("auto_map"):
-                validation_results["warnings"].append("No auto_map found in config - may not load correctly with trust_remote_code=True")
+                validation_results["warnings"].append(
+                    "No auto_map found in config - may not load correctly with trust_remote_code=True"
+                )
 
         except json.JSONDecodeError as e:
             validation_results["valid"] = False
@@ -335,14 +391,18 @@ def validate_custom_model_directory(model_path: str) -> dict:
     modeling_path = os.path.join(model_path, "modeling.py")
     if os.path.exists(modeling_path):
         try:
-            with open(modeling_path, 'r') as f:
+            with open(modeling_path, "r") as f:
                 content = f.read()
 
             if "MultiLabelTokenClassificationModelCustom" not in content:
                 validation_results["valid"] = False
-                validation_results["errors"].append("modeling.py does not contain MultiLabelTokenClassificationModelCustom class")
+                validation_results["errors"].append(
+                    "modeling.py does not contain MultiLabelTokenClassificationModelCustom class"
+                )
 
         except Exception as e:
-            validation_results["warnings"].append(f"Could not read modeling.py: {str(e)}")
+            validation_results["warnings"].append(
+                f"Could not read modeling.py: {str(e)}"
+            )
 
     return validation_results

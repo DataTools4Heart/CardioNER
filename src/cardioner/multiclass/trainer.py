@@ -1,45 +1,70 @@
-from os import environ
-import spacy
+import json
+import os
 import shutil
+from os import environ
+
+import spacy
 
 # Load a spaCy model for tokenization
 environ["WANDB_MODE"] = "disabled"
 environ["WANDB_DISABLED"] = "true"
 
-from typing import List, Dict, Optional, Union
 from collections import defaultdict
-from transformers import AutoTokenizer, DataCollatorForTokenClassification
-from transformers import AutoModelForTokenClassification, TrainingArguments, Trainer
-from transformers import RobertaModel, RobertaForTokenClassification
-from transformers import AutoConfig, PreTrainedModel
-from transformers.modeling_outputs import TokenClassifierOutput
+from typing import Dict, List, Optional, Union
+
 import numpy as np
 import torch
-from transformers.utils import logging
 from torchcrf import CRF
+from transformers import (
+    AutoConfig,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    DataCollatorForTokenClassification,
+    PreTrainedModel,
+    RobertaForTokenClassification,
+    RobertaModel,
+    Trainer,
+    TrainingArguments,
+)
+from transformers.modeling_outputs import TokenClassifierOutput
+from transformers.utils import logging
 from utils import pretty_print_classifier
 
 # Import custom model classes
 try:
-    from .modeling import TokenClassificationModelCRF, TokenClassificationModel
+    from .modeling import (
+        MultiHeadConfig,
+        MultiHeadCRFConfig,
+        TokenClassificationModel,
+        TokenClassificationModelCRF,
+        TokenClassificationModelMultiHead,
+        TokenClassificationModelMultiHeadCRF,
+    )
 except ImportError:
     try:
-        from modeling import TokenClassificationModelCRF, TokenClassificationModel
+        from modeling import (
+            MultiHeadConfig,
+            MultiHeadCRFConfig,
+            TokenClassificationModel,
+            TokenClassificationModelCRF,
+            TokenClassificationModelMultiHead,
+            TokenClassificationModelMultiHeadCRF,
+        )
     except ImportError:
         print("Warning: Could not import custom model classes from modeling.py")
         TokenClassificationModelCRF = None
         TokenClassificationModel = None
+        TokenClassificationModelMultiHeadCRF = None
+        TokenClassificationModelMultiHead = None
+        MultiHeadCRFConfig = None
+        MultiHeadConfig = None
 
 logging.set_verbosity_debug()
 
+import evaluate
 from torch import nn
 
-import evaluate
 metric = evaluate.load("seqeval")
-
-# TODO: add multihead CRF: https://github.com/ieeta-pt/Multi-Head-CRF/tree/master/src/model
-
-
 
 
 class CustomDataCollatorForTokenClassification(DataCollatorForTokenClassification):
@@ -47,113 +72,145 @@ class CustomDataCollatorForTokenClassification(DataCollatorForTokenClassificatio
         # Call the superclass method to process the batch
         #
         for feature in features:
-            if 'labels' in feature:
-                lbls = feature['labels']
+            if "labels" in feature:
+                lbls = feature["labels"]
                 # If lbls is one-hot encoded (e.g. [seq_length, num_labels] per example),
                 # first convert to a tensor and then argmax:
                 if torch.Tensor(lbls).ndim == 2:
                     lbls_tensor = torch.tensor(lbls, dtype=torch.float)
                     lbls = lbls_tensor.argmax(dim=-1).tolist()
-                    lbls = [label if label != -100 else self.label_pad_token_id for label in lbls]
-                    if len(lbls) < len(feature['input_ids']):
-                        lbls = lbls + [self.label_pad_token_id] * (len(feature['input_ids']) - len(lbls))
+                    lbls = [
+                        label if label != -100 else self.label_pad_token_id
+                        for label in lbls
+                    ]
+                    if len(lbls) < len(feature["input_ids"]):
+                        lbls = lbls + [self.label_pad_token_id] * (
+                            len(feature["input_ids"]) - len(lbls)
+                        )
                     # Now lbls is a simple list of integers
                 else:
-                    lbls = [label if label != -100 else self.label_pad_token_id for label in lbls]
-                    lbls = lbls + [self.label_pad_token_id] * (len(feature['input_ids']) - len(lbls))
+                    lbls = [
+                        label if label != -100 else self.label_pad_token_id
+                        for label in lbls
+                    ]
+                    lbls = lbls + [self.label_pad_token_id] * (
+                        len(feature["input_ids"]) - len(lbls)
+                    )
 
-                if (-100 in lbls) & (self.label_pad_token_id!=-100):
+                if (-100 in lbls) & (self.label_pad_token_id != -100):
                     print("Warning: -100 found in labels after replacement!")
 
-                feature['labels'] = lbls
+                feature["labels"] = lbls
 
         # Now call the superclass, which will handle converting everything to tensors
         batch = super().__call__(features)
         return batch
 
 
-class ModelTrainer():
-    def __init__(self,
-                 label2id: Dict[str, int],
-                 id2label: Dict[int, str],
-                 tokenizer=None,
-                 model: str='CLTL/MedRoBERTa.nl',
-                 use_crf: bool=False,
-                 batch_size: int=48,
-                 max_length: int=514,
-                 learning_rate: float=1e-4,
-                 weight_decay: float=0.001,
-                 num_train_epochs: int=3,
-                 output_dir: str="../../output",
-                 hf_token: str=None,
-                 freeze_backbone: bool=False,
-                 gradient_accumulation_steps: int=1,
-                 classifier_hidden_layers: tuple|None=None,
-                 classifier_dropout: float=0.1,
-                 class_weights: List[float]|None = None
+class ModelTrainer:
+    def __init__(
+        self,
+        label2id: Dict[str, int],
+        id2label: Dict[int, str],
+        tokenizer=None,
+        model: str = "CLTL/MedRoBERTa.nl",
+        use_crf: bool = False,
+        batch_size: int = 48,
+        max_length: int = 514,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.001,
+        num_train_epochs: int = 3,
+        output_dir: str = "../../output",
+        hf_token: str = None,
+        freeze_backbone: bool = False,
+        gradient_accumulation_steps: int = 1,
+        classifier_hidden_layers: tuple | None = None,
+        classifier_dropout: float = 0.1,
+        class_weights: List[float] | None = None,
     ):
         self.label2id = label2id
         self.id2label = id2label
         self.output_dir = output_dir
 
         self.train_kwargs = {
-            'run_name': 'CardioNER',
-            'per_device_train_batch_size': batch_size,
-            'per_device_eval_batch_size': batch_size,
-            'gradient_accumulation_steps': gradient_accumulation_steps,
-            'learning_rate': learning_rate,
-            'num_train_epochs': num_train_epochs,
-            'weight_decay': weight_decay,
-            'eval_strategy':'epoch',
-            'save_strategy': 'epoch',
-            'save_total_limit': 1,
-            'report_to': 'tensorboard',
-            'use_cpu': False,
-            'logging_dir': f"{output_dir}/logs",
-            'logging_strategy': 'steps',
-            'logging_steps': 256,
+            "run_name": "CardioNER",
+            "per_device_train_batch_size": batch_size,
+            "per_device_eval_batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "weight_decay": weight_decay,
+            "eval_strategy": "epoch",
+            "save_strategy": "epoch",
+            "save_total_limit": 1,
+            "report_to": "tensorboard",
+            "use_cpu": False,
+            "logging_dir": f"{output_dir}/logs",
+            "logging_strategy": "steps",
+            "logging_steps": 256,
         }
-        self.crf=use_crf
+        self.crf = use_crf
 
         if use_crf:
-            self.pad_token_id = len(label2id) + 1
-            num_labels = len(label2id) + 1
-            id2label[self.pad_token_id]='PADDING'
-            label2id['PADDING'] = self.pad_token_id
+            # Use O label (0) for masked positions - no separate PADDING class needed
+            # Following ieeta-pt approach: special tokens get O label
+            self.pad_token_id = 0  # O label
         else:
-            self.pad_token_id  = -100
+            self.pad_token_id = -100
             # num_labels = len(label2id)  # unused variable
 
         if tokenizer is None:
             print("LOADING TOKENIZER")
-            self.tokenizer = AutoTokenizer.from_pretrained(model,
-                add_prefix_space=True, model_max_length=max_length, padding="max_length", truncation=True, token=hf_token)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model,
+                add_prefix_space=True,
+                model_max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                token=hf_token,
+            )
         else:
             self.tokenizer = tokenizer
 
         self.tokenizer.model_max_length = max_length
-        self.data_collator = CustomDataCollatorForTokenClassification(tokenizer=self.tokenizer, max_length=max_length,
-                                                                padding="max_length", label_pad_token_id=self.pad_token_id )
+        self.data_collator = CustomDataCollatorForTokenClassification(
+            tokenizer=self.tokenizer,
+            max_length=max_length,
+            padding="max_length",
+            label_pad_token_id=self.pad_token_id,
+        )
 
-        or_config = AutoConfig.from_pretrained(model, hf_token=hf_token, return_unused_kwargs=False)
-        or_config.num_labels=len(self.label2id)
-        or_config.id2label=self.id2label
-        or_config.label2id=self.label2id
-        or_config.hidden_dropout_prob=0.1
+        or_config = AutoConfig.from_pretrained(
+            model, hf_token=hf_token, return_unused_kwargs=False
+        )
+        or_config.num_labels = len(self.label2id)
+        or_config.id2label = self.id2label
+        or_config.label2id = self.label2id
+        or_config.hidden_dropout_prob = 0.1
         or_config.classifier_hidden_layers = classifier_hidden_layers
         or_config.classifier_dropout = classifier_dropout
         or_config.class_weights = class_weights
 
-        self.classifier_hidden_layers= classifier_hidden_layers
+        self.classifier_hidden_layers = classifier_hidden_layers
         self.classifier_dropout = classifier_dropout
         self.class_weights = class_weights
 
         if use_crf:
             if TokenClassificationModelCRF is None:
-                raise ImportError("TokenClassificationModelCRF could not be imported. Please ensure modeling.py is available.")
+                raise ImportError(
+                    "TokenClassificationModelCRF could not be imported. Please ensure modeling.py is available."
+                )
             print("USING CRF:", self.crf)
-            base_model = RobertaForTokenClassification.from_pretrained(model, config=or_config)
-            self.model = TokenClassificationModelCRF(or_config, base_model, freeze_backbone, classifier_hidden_layers, classifier_dropout)
+            base_model = RobertaForTokenClassification.from_pretrained(
+                model, config=or_config, ignore_mismatched_sizes=True
+            )
+            self.model = TokenClassificationModelCRF(
+                or_config,
+                base_model,
+                freeze_backbone,
+                classifier_hidden_layers,
+                classifier_dropout,
+            )
 
             # Set up auto_map for trust_remote_code loading
             self.model.config.auto_map = {
@@ -161,8 +218,12 @@ class ModelTrainer():
             }
         else:
             if TokenClassificationModel is None:
-                raise ImportError("TokenClassificationModel could not be imported. Please ensure modeling.py is available.")
-            self.model = TokenClassificationModel.from_pretrained(model, config=or_config)
+                raise ImportError(
+                    "TokenClassificationModel could not be imported. Please ensure modeling.py is available."
+                )
+            self.model = TokenClassificationModel.from_pretrained(
+                model, config=or_config, ignore_mismatched_sizes=True
+            )
 
             # Set up auto_map for trust_remote_code loading
             self.model.config.auto_map = {
@@ -170,7 +231,9 @@ class ModelTrainer():
             }
 
         # Mark that this is a custom model requiring trust_remote_code
-        self.model.config.custom_model_type = "TokenClassificationModelCRF" if use_crf else "TokenClassificationModel"
+        self.model.config.custom_model_type = (
+            "TokenClassificationModelCRF" if use_crf else "TokenClassificationModel"
+        )
         self.model.config.requires_trust_remote_code = True
 
         # optionally freeze the backbone
@@ -184,54 +247,55 @@ class ModelTrainer():
         print("Model:", type(self.model))
         print("Device:", self.device)
         print("Tokenizer max length:", self.tokenizer.model_max_length)
-        print("Model max position embeddings:", self.model.config.max_position_embeddings)
+        print(
+            "Model max position embeddings:", self.model.config.max_position_embeddings
+        )
         print("Number of labels:", len(self.label2id))
         print("Labels:", self.label2id)
         print("id2label:", self.id2label)
         print("Model config:", self.model.config)
-        print("Classifier architecture:", pretty_print_classifier(self.model.classifier))
-
-        self.args = TrainingArguments(
-            output_dir=output_dir,
-            **self.train_kwargs
+        print(
+            "Classifier architecture:", pretty_print_classifier(self.model.classifier)
         )
+
+        self.args = TrainingArguments(output_dir=output_dir, **self.train_kwargs)
 
     def compute_metrics(self, eval_preds):
         logits, labels = eval_preds
         if self.crf:
-            mask = labels != self.pad_token_id
-            mask[:, 0] = True
-
-            # self.model.device_info()
-            emissions_torch = torch.from_numpy(logits).float().to(self.device)
-            mask_torch = torch.from_numpy(mask).bool().to(self.device)
-
-            predictions = self.model.crf.decode(emissions=emissions_torch, mask=mask_torch)
+            # Following ieeta-pt approach: don't pass mask to CRF decode
+            # All positions have valid labels (O for special/padding tokens)
+            crf_device = next(self.model.crf.parameters()).device
+            emissions_torch = torch.from_numpy(logits).float().to(crf_device)
+            predictions = self.model.crf.decode(emissions=emissions_torch)
         else:
             predictions = np.argmax(logits, -1)
 
         # Access the id2label mapping
         id2label = self.id2label  # Dictionary mapping IDs to labels
 
-        # Remove ignored index (special tokens) and convert to label names
-        true_labels = [
-            [id2label[l] for l in label if l != self.pad_token_id]
-            for label in labels
-        ]
+        # Convert to label names for seqeval
+        # Following ieeta-pt approach: all positions have valid O/B/I labels
+        true_labels = []
+        true_predictions = []
 
-        try:
-            true_predictions = [
-                [id2label[p] for (p, l) in zip(prediction, label) if l != self.pad_token_id]
-                for prediction, label in zip(predictions, labels)
-            ]
-        except Exception as e:
-            print(f"Predictions: {predictions}")
-            print(f"Labels: {labels}")
+        for prediction, label in zip(predictions, labels):
+            seq_labels = []
+            seq_preds = []
+            for p, l in zip(prediction, label):
+                label_name = id2label.get(int(l), "O")
+                pred_name = id2label.get(int(p), "O")
 
-        all_metrics = metric.compute(predictions=true_predictions,
-                        references=true_labels)
+                seq_labels.append(label_name)
+                seq_preds.append(pred_name)
+
+            true_labels.append(seq_labels)
+            true_predictions.append(seq_preds)
+
+        all_metrics = metric.compute(
+            predictions=true_predictions, references=true_labels
+        )
         return all_metrics
-
 
     def save_model(self, output_dir=None):
         """Custom method to save both the model architecture and state dict properly"""
@@ -239,9 +303,10 @@ class ModelTrainer():
 
         # Copy the modeling.py file to output_dir for trust_remote_code compatibility
         import os
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        modeling_src = os.path.join(current_dir, 'modeling.py')
-        modeling_dst = os.path.join(save_dir, 'modeling.py')
+        modeling_src = os.path.join(current_dir, "modeling.py")
+        modeling_dst = os.path.join(save_dir, "modeling.py")
 
         # Ensure output directory exists
         os.makedirs(save_dir, exist_ok=True)
@@ -254,7 +319,9 @@ class ModelTrainer():
             if not os.path.exists(modeling_dst):
                 raise ValueError(f"Failed to copy modeling.py to {modeling_dst}")
         else:
-            raise ValueError(f"modeling.py not found at {modeling_src}. This file is required for custom models with trust_remote_code=True.")
+            raise ValueError(
+                f"modeling.py not found at {modeling_src}. This file is required for custom models with trust_remote_code=True."
+            )
 
         # Set model configuration
         self.model.config.architectures = [self.model.__class__.__name__]
@@ -268,17 +335,19 @@ class ModelTrainer():
             self.tokenizer.save_pretrained(save_dir)
 
         print(f"Custom model saved successfully! To load this model, use:")
-        print(f"AutoModelForTokenClassification.from_pretrained('{save_dir}', trust_remote_code=True)")
+        print(
+            f"AutoModelForTokenClassification.from_pretrained('{save_dir}', trust_remote_code=True)"
+        )
         print(f"Model saved to {save_dir}")
 
-
-    def train(self,
+    def train(
+        self,
         train_data: List[Dict],
         test_data: List[Dict],
         eval_data: List[Dict],
-        profile: bool=False):
-
-        if len(test_data)>0:
+        profile: bool = False,
+    ):
+        if len(test_data) > 0:
             _eval_data = test_data
         else:
             _eval_data = eval_data
@@ -306,10 +375,10 @@ class ModelTrainer():
         if profile:
             with torch.profiler.profile(
                 schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler("./log"),
                 record_shapes=False,
                 profile_memory=True,
-                with_stack=True
+                with_stack=True,
             ) as prof:
                 trainer.train()
         else:
@@ -323,10 +392,767 @@ class ModelTrainer():
             trainer.save_metrics(self.output_dir, metrics=metrics)
         except Exception as e:
             try:
-                trainer.save_model('output')
-                trainer.save_metrics('output', metrics=metrics)
+                trainer.save_model("output")
+                trainer.save_metrics("output", metrics=metrics)
                 print(f"Saved to fallback directory 'output' due to error: {str(e)}")
             except Exception as e2:
                 raise ValueError(f"Failed to save model and metrics: {str(e2)}")
         torch.cuda.empty_cache()
         return True
+
+
+class MultiHeadDataCollatorForTokenClassification(DataCollatorForTokenClassification):
+    """
+    Data collator for Multi-Head CRF that handles labels as dictionaries
+    mapping entity types to their respective label sequences.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        entity_types: List[str],
+        max_length: int = 512,
+        padding: str = "max_length",
+        label_pad_token_id: int = 0,  # Use O label for masked positions (CRF can't handle -100)
+    ):
+        super().__init__(
+            tokenizer=tokenizer,
+            max_length=max_length,
+            padding=padding,
+            label_pad_token_id=label_pad_token_id,
+        )
+        self.entity_types = entity_types
+        self.ignore_index = -100  # Original ignore index from tokenizer alignment
+
+    def __call__(self, features, *args, **kwargs):
+        # Separate out the multi-head labels before standard collation
+        # Following ieeta-pt approach: use O label (0) for all special/padding positions
+        # No separate mask tracking needed - CRF handles all positions uniformly
+        entity_labels = {ent: [] for ent in self.entity_types}
+
+        for feature in features:
+            if "labels" in feature and isinstance(feature["labels"], dict):
+                for ent in self.entity_types:
+                    if ent in feature["labels"]:
+                        lbls = feature["labels"][ent]
+                        # Handle one-hot encoded labels
+                        if torch.Tensor(lbls).ndim == 2:
+                            lbls_tensor = torch.tensor(lbls, dtype=torch.float)
+                            lbls = lbls_tensor.argmax(dim=-1).tolist()
+
+                        # Replace -100 (ignore index) with O label (0)
+                        # This follows ieeta-pt approach: special tokens get O label
+                        lbls = [
+                            l if l != self.ignore_index else self.label_pad_token_id
+                            for l in lbls
+                        ]
+
+                        # Pad to input length with O label
+                        if len(lbls) < len(feature["input_ids"]):
+                            pad_len = len(feature["input_ids"]) - len(lbls)
+                            lbls = lbls + [self.label_pad_token_id] * pad_len
+
+                        entity_labels[ent].append(lbls)
+                    else:
+                        # Default to O label if entity type not present
+                        entity_labels[ent].append(
+                            [self.label_pad_token_id] * len(feature["input_ids"])
+                        )
+
+                # Remove the dict labels so standard collation can proceed
+                del feature["labels"]
+
+        # Standard collation for non-label fields
+        batch = super().__call__(features)
+
+        # Add back the entity-specific labels as tensors
+        batch["labels"] = {
+            ent: torch.tensor(entity_labels[ent], dtype=torch.long)
+            for ent in self.entity_types
+        }
+
+        return batch
+
+
+class MultiHeadCRFTrainer:
+    """
+    Trainer for Multi-Head CRF models that handle multiple entity types simultaneously.
+
+    Each entity type gets its own CRF head, allowing for overlapping entities
+    and entity-type-specific transition patterns.
+    """
+
+    def __init__(
+        self,
+        entity_types: List[str],
+        label2id: Dict[str, int],  # BIO labels: {"O": 0, "B": 1, "I": 2}
+        id2label: Dict[int, str],
+        tokenizer=None,
+        model: str = "CLTL/MedRoBERTa.nl",
+        batch_size: int = 48,
+        max_length: int = 514,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.001,
+        num_train_epochs: int = 3,
+        output_dir: str = "../../output",
+        hf_token: str = None,
+        freeze_backbone: bool = False,
+        num_frozen_encoders: int = 0,
+        gradient_accumulation_steps: int = 1,
+        number_of_layers_per_head: int = 1,
+        classifier_dropout: float = 0.1,
+        crf_reduction: str = "mean",
+    ):
+        self.entity_types = sorted(entity_types)  # Sort for consistency
+        self.label2id = label2id
+        self.id2label = id2label
+        self.output_dir = output_dir
+
+        # Use O label (0) for masked positions - no separate PADDING class needed
+        # The attention_mask excludes these positions from CRF loss and decoding
+        self.label_pad_token_id = 0  # O label
+        num_labels = len(label2id)  # Should be 3: O, B, I
+
+        self.train_kwargs = {
+            "run_name": "CardioNER-MultiHeadCRF",
+            "per_device_train_batch_size": batch_size,
+            "per_device_eval_batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "weight_decay": weight_decay,
+            "eval_strategy": "epoch",
+            "save_strategy": "epoch",
+            "save_total_limit": 1,
+            "report_to": "tensorboard",
+            "use_cpu": False,
+            "logging_dir": f"{output_dir}/logs",
+            "logging_strategy": "steps",
+            "logging_steps": 256,
+        }
+
+        # Load tokenizer
+        if tokenizer is None:
+            print("LOADING TOKENIZER")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model,
+                add_prefix_space=True,
+                model_max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                token=hf_token,
+            )
+        else:
+            self.tokenizer = tokenizer
+
+        self.tokenizer.model_max_length = max_length
+
+        # Data collator for multi-head labels
+        self.data_collator = MultiHeadDataCollatorForTokenClassification(
+            tokenizer=self.tokenizer,
+            entity_types=self.entity_types,
+            max_length=max_length,
+            padding="max_length",
+            label_pad_token_id=self.label_pad_token_id,
+        )
+
+        # Create MultiHeadCRF config
+        base_config = AutoConfig.from_pretrained(model, token=hf_token)
+        config = MultiHeadCRFConfig(
+            entity_types=self.entity_types,
+            number_of_layers_per_head=number_of_layers_per_head,
+            crf_reduction=crf_reduction,
+            freeze_backbone=freeze_backbone,
+            num_frozen_encoders=num_frozen_encoders,
+            classifier_dropout=classifier_dropout,
+            num_labels=num_labels,
+            id2label=id2label,
+            label2id=label2id,
+            # Copy base config attributes
+            hidden_size=base_config.hidden_size,
+            hidden_dropout_prob=base_config.hidden_dropout_prob,
+            vocab_size=base_config.vocab_size,
+            max_position_embeddings=base_config.max_position_embeddings,
+            type_vocab_size=getattr(base_config, "type_vocab_size", 1),
+            num_attention_heads=base_config.num_attention_heads,
+            num_hidden_layers=base_config.num_hidden_layers,
+            intermediate_size=base_config.intermediate_size,
+        )
+
+        # Load base model and create MultiHeadCRF model
+        if TokenClassificationModelMultiHeadCRF is None:
+            raise ImportError(
+                "TokenClassificationModelMultiHeadCRF could not be imported."
+            )
+
+        base_model = RobertaForTokenClassification.from_pretrained(
+            model, config=base_config, token=hf_token, ignore_mismatched_sizes=True
+        )
+        self.model = TokenClassificationModelMultiHeadCRF(
+            config, base_model, freeze_backbone
+        )
+
+        # Set up auto_map for trust_remote_code loading
+        self.model.config.auto_map = {
+            "AutoModel": "modeling.TokenClassificationModelMultiHeadCRF",
+            "AutoModelForTokenClassification": "modeling.TokenClassificationModelMultiHeadCRF",
+        }
+        self.model.config.architectures = ["TokenClassificationModelMultiHeadCRF"]
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        print("=" * 50)
+        print("Multi-Head CRF Model Configuration:")
+        print(f"  Entity types: {self.entity_types}")
+        print(f"  Number of labels per head: {num_labels}")
+        print(f"  Layers per head: {number_of_layers_per_head}")
+        print(f"  CRF reduction: {crf_reduction}")
+        print(f"  Freeze backbone: {freeze_backbone}")
+        print(f"  Device: {self.device}")
+        print("=" * 50)
+
+        self.args = TrainingArguments(output_dir=output_dir, **self.train_kwargs)
+
+    def compute_metrics(self, eval_preds):
+        """
+        Compute metrics for multi-head predictions.
+
+        For multi-head CRF, predictions are organized by entity type.
+        Following ieeta-pt approach: all positions use valid labels (O for special tokens),
+        so we evaluate all non-padding positions based on attention_mask.
+
+        Args:
+            eval_preds: Tuple of (predictions_dict, labels_dict)
+                - predictions_dict: {entity_type: decoded_sequences}
+                - labels_dict: {entity_type: label_sequences}
+        """
+        predictions_dict, labels_dict = eval_preds
+
+        all_metrics = {}
+
+        for entity_type in self.entity_types:
+            if entity_type not in predictions_dict or entity_type not in labels_dict:
+                continue
+
+            predictions = predictions_dict[entity_type]
+            labels = labels_dict[entity_type]
+
+            # Convert to label names for seqeval
+            # All positions have valid labels (O for special/padding tokens)
+            true_labels = []
+            true_predictions = []
+
+            for pred_seq, label_seq in zip(predictions, labels):
+                seq_labels = []
+                seq_preds = []
+                for p, l in zip(pred_seq, label_seq):
+                    label_name = self.id2label.get(int(l), "O")
+                    pred_name = self.id2label.get(int(p), "O")
+
+                    seq_labels.append(label_name)
+                    seq_preds.append(pred_name)
+
+                if seq_labels:  # Only add non-empty sequences
+                    true_labels.append(seq_labels)
+                    true_predictions.append(seq_preds)
+
+            # Compute metrics for this entity type
+            if true_labels:
+                entity_metrics = metric.compute(
+                    predictions=true_predictions, references=true_labels
+                )
+
+                # Prefix metrics with entity type
+                for key, value in entity_metrics.items():
+                    all_metrics[f"{entity_type}_{key}"] = value
+
+        return all_metrics
+
+    def save_model(self, output_dir=None):
+        """Save the multi-head CRF model with all necessary files."""
+        import os
+
+        save_dir = output_dir or self.output_dir
+
+        # Ensure output directory exists
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Copy modeling.py for trust_remote_code compatibility
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        modeling_src = os.path.join(current_dir, "modeling.py")
+        modeling_dst = os.path.join(save_dir, "modeling.py")
+
+        if os.path.exists(modeling_src):
+            shutil.copyfile(modeling_src, modeling_dst)
+            print(f"Copied modeling.py to {modeling_dst}")
+        else:
+            raise ValueError(f"modeling.py not found at {modeling_src}")
+
+        # Save model and tokenizer
+        self.model.save_pretrained(save_dir)
+        if self.tokenizer:
+            self.tokenizer.save_pretrained(save_dir)
+
+        print(f"Multi-Head CRF model saved to {save_dir}")
+        print(
+            f"To load: TokenClassificationModelMultiHeadCRF.from_pretrained('{save_dir}', trust_remote_code=True)"
+        )
+
+    def train(
+        self,
+        train_data: List[Dict],
+        test_data: List[Dict],
+        eval_data: List[Dict],
+        profile: bool = False,
+    ):
+        """
+        Train the multi-head CRF model.
+
+        Data should have 'labels' as a dict mapping entity types to label sequences.
+        """
+        _eval_data = test_data if len(test_data) > 0 else eval_data
+
+        # Custom trainer that handles multi-head loss computation
+        class MultiHeadCRFHFTrainer(Trainer):
+            def __init__(self, parent_trainer, **kwargs):
+                super().__init__(**kwargs)
+                self.parent_trainer = parent_trainer
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                labels = inputs.pop("labels", None)
+                outputs = model(**inputs, labels=labels)
+
+                if labels is not None:
+                    loss, logits = outputs
+                else:
+                    loss = None
+                    logits = outputs
+
+                return (loss, {"logits": logits}) if return_outputs else loss
+
+            def prediction_step(
+                self, model, inputs, prediction_loss_only, ignore_keys=None
+            ):
+                """Override to handle multi-head CRF decoding."""
+                labels = inputs.pop("labels", None)
+
+                with torch.no_grad():
+                    outputs = model(**inputs, labels=labels)
+
+                    if labels is not None:
+                        loss, logits = outputs
+                    else:
+                        loss = None
+                        logits = outputs
+
+                if prediction_loss_only:
+                    return (loss, None, None)
+
+                # Decode using CRF for each entity type
+                # Following ieeta-pt: don't pass mask to decode, let CRF decode all positions
+                predictions = {}
+                for entity_type in self.parent_trainer.entity_types:
+                    crf = getattr(model, f"{entity_type}_crf")
+                    decoded = crf.decode(logits[entity_type])
+                    # Pad decoded sequences to same length for batching
+                    max_len = max(len(seq) for seq in decoded)
+                    padded = [seq + [0] * (max_len - len(seq)) for seq in decoded]
+                    # Return as tensor to be compatible with HuggingFace Trainer
+                    predictions[entity_type] = torch.tensor(padded)
+
+                # Return labels directly (all positions have valid O/B/I labels)
+                # Keep as tensors for HuggingFace Trainer compatibility
+                labels_out = {}
+                if labels is not None:
+                    for entity_type in self.parent_trainer.entity_types:
+                        labels_out[entity_type] = labels[entity_type].cpu()
+
+                return (loss, predictions, labels_out)
+
+            def save_model(self, output_dir=None, _internal_call=False):
+                self.parent_trainer.save_model(output_dir)
+
+        trainer = MultiHeadCRFHFTrainer(
+            parent_trainer=self,
+            model=self.model,
+            args=self.args,
+            train_dataset=train_data,
+            eval_dataset=_eval_data,
+            data_collator=self.data_collator,
+            processing_class=self.tokenizer,
+            compute_metrics=self.compute_metrics,
+        )
+
+        if profile:
+            with torch.profiler.profile(
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler("./log"),
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                trainer.train()
+        else:
+            trainer.train()
+
+        # Evaluate and save metrics
+        metrics = trainer.evaluate(eval_dataset=_eval_data)
+
+        # Save metrics to JSON file
+        metrics_path = os.path.join(self.output_dir, "eval_results.json")
+        os.makedirs(self.output_dir, exist_ok=True)
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Evaluation metrics saved to {metrics_path}")
+
+        # Save model
+        self.model = self.model.to(dtype=torch.bfloat16)
+        try:
+            trainer.save_model(self.output_dir)
+        except Exception as e:
+            print(f"Error saving model: {e}")
+            try:
+                trainer.save_model("output")
+            except Exception as e2:
+                raise ValueError(f"Failed to save model: {e2}")
+
+        torch.cuda.empty_cache()
+        return metrics
+
+
+class MultiHeadTrainer:
+    """
+    Trainer for Multi-Head models (without CRF) that handle multiple entity types simultaneously.
+
+    Each entity type gets its own classification head, allowing for overlapping entities.
+    Uses standard CrossEntropyLoss instead of CRF, which is faster but doesn't enforce
+    valid BIO sequences.
+    """
+
+    def __init__(
+        self,
+        entity_types: List[str],
+        label2id: Dict[str, int],  # BIO labels: {"O": 0, "B": 1, "I": 2}
+        id2label: Dict[int, str],
+        tokenizer=None,
+        model: str = "CLTL/MedRoBERTa.nl",
+        batch_size: int = 48,
+        max_length: int = 514,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.001,
+        num_train_epochs: int = 3,
+        output_dir: str = "../../output",
+        hf_token: str = None,
+        freeze_backbone: bool = False,
+        num_frozen_encoders: int = 0,
+        gradient_accumulation_steps: int = 1,
+        number_of_layers_per_head: int = 1,
+        classifier_dropout: float = 0.1,
+        use_class_weights: bool = False,
+        class_weights: Optional[Dict[str, List[float]]] = None,
+    ):
+        self.entity_types = sorted(entity_types)  # Sort for consistency
+        self.label2id = label2id
+        self.id2label = id2label
+        self.output_dir = output_dir
+
+        # Use -100 for ignored positions in CrossEntropyLoss
+        self.label_pad_token_id = 0  # O label for padding
+        num_labels = len(label2id)  # Should be 3: O, B, I
+
+        self.train_kwargs = {
+            "run_name": "CardioNER-MultiHead",
+            "per_device_train_batch_size": batch_size,
+            "per_device_eval_batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "weight_decay": weight_decay,
+            "eval_strategy": "epoch",
+            "save_strategy": "epoch",
+            "save_total_limit": 1,
+            "report_to": "tensorboard",
+            "use_cpu": False,
+            "logging_dir": f"{output_dir}/logs",
+            "logging_strategy": "steps",
+            "logging_steps": 256,
+        }
+
+        # Load tokenizer
+        if tokenizer is None:
+            print("LOADING TOKENIZER")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model,
+                add_prefix_space=True,
+                model_max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                token=hf_token,
+            )
+        else:
+            self.tokenizer = tokenizer
+
+        self.tokenizer.model_max_length = max_length
+
+        # Data collator for multi-head labels (reuse from CRF trainer)
+        self.data_collator = MultiHeadDataCollatorForTokenClassification(
+            tokenizer=self.tokenizer,
+            entity_types=self.entity_types,
+            max_length=max_length,
+            padding="max_length",
+            label_pad_token_id=self.label_pad_token_id,
+        )
+
+        # Create MultiHead config (no CRF)
+        base_config = AutoConfig.from_pretrained(model, token=hf_token)
+        config = MultiHeadConfig(
+            entity_types=self.entity_types,
+            number_of_layers_per_head=number_of_layers_per_head,
+            freeze_backbone=freeze_backbone,
+            num_frozen_encoders=num_frozen_encoders,
+            classifier_dropout=classifier_dropout,
+            use_class_weights=use_class_weights,
+            class_weights=class_weights,
+            num_labels=num_labels,
+            id2label=id2label,
+            label2id=label2id,
+            # Copy base config attributes
+            hidden_size=base_config.hidden_size,
+            hidden_dropout_prob=base_config.hidden_dropout_prob,
+            vocab_size=base_config.vocab_size,
+            max_position_embeddings=base_config.max_position_embeddings,
+            type_vocab_size=getattr(base_config, "type_vocab_size", 1),
+            num_attention_heads=base_config.num_attention_heads,
+            num_hidden_layers=base_config.num_hidden_layers,
+            intermediate_size=base_config.intermediate_size,
+        )
+
+        # Load base model and create MultiHead model
+        if TokenClassificationModelMultiHead is None:
+            raise ImportError(
+                "TokenClassificationModelMultiHead could not be imported."
+            )
+
+        base_model = RobertaForTokenClassification.from_pretrained(
+            model, config=base_config, token=hf_token, ignore_mismatched_sizes=True
+        )
+        self.model = TokenClassificationModelMultiHead(
+            config, base_model, freeze_backbone
+        )
+
+        # Set up auto_map for trust_remote_code loading
+        self.model.config.auto_map = {
+            "AutoModel": "modeling.TokenClassificationModelMultiHead",
+            "AutoModelForTokenClassification": "modeling.TokenClassificationModelMultiHead",
+        }
+        self.model.config.architectures = ["TokenClassificationModelMultiHead"]
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        print("=" * 50)
+        print("Multi-Head Model Configuration (no CRF):")
+        print(f"  Entity types: {self.entity_types}")
+        print(f"  Number of labels per head: {num_labels}")
+        print(f"  Layers per head: {number_of_layers_per_head}")
+        print(f"  Use class weights: {use_class_weights}")
+        print(f"  Freeze backbone: {freeze_backbone}")
+        print(f"  Device: {self.device}")
+        print("=" * 50)
+
+        self.args = TrainingArguments(output_dir=output_dir, **self.train_kwargs)
+
+    def compute_metrics(self, eval_pred):
+        """
+        Compute metrics for multi-head model evaluation.
+
+        Returns metrics per entity type and averaged across all entity types.
+        """
+        predictions, labels = eval_pred
+
+        # Handle both dict and tuple/list formats
+        if isinstance(predictions, dict):
+            pred_dict = predictions
+            label_dict = labels
+        else:
+            # Assume sorted entity types order
+            pred_dict = {ent: predictions[i] for i, ent in enumerate(self.entity_types)}
+            label_dict = {ent: labels[i] for i, ent in enumerate(self.entity_types)}
+
+        all_metrics = {}
+        per_entity_f1 = []
+
+        for entity_type in self.entity_types:
+            preds = pred_dict[entity_type]
+            labs = label_dict[entity_type]
+
+            # Convert to lists and filter padding
+            true_predictions = []
+            true_labels = []
+
+            for pred_seq, label_seq in zip(preds, labs):
+                pred_tags = []
+                label_tags = []
+
+                for p, l in zip(pred_seq, label_seq):
+                    # Skip padding positions (label == -100 or position after sequence ends)
+                    if l == -100:
+                        continue
+                    pred_tags.append(self.id2label[int(p)])
+                    label_tags.append(self.id2label[int(l)])
+
+                if pred_tags:
+                    true_predictions.append(pred_tags)
+                    true_labels.append(label_tags)
+
+            if true_predictions:
+                results = metric.compute(
+                    predictions=true_predictions, references=true_labels
+                )
+
+                all_metrics[f"{entity_type}_precision"] = results.get(
+                    "overall_precision", 0.0
+                )
+                all_metrics[f"{entity_type}_recall"] = results.get(
+                    "overall_recall", 0.0
+                )
+                all_metrics[f"{entity_type}_f1"] = results.get("overall_f1", 0.0)
+
+                per_entity_f1.append(results.get("overall_f1", 0.0))
+
+        # Compute macro average
+        if per_entity_f1:
+            all_metrics["macro_f1"] = sum(per_entity_f1) / len(per_entity_f1)
+
+        return all_metrics
+
+    def save_model(self, output_dir=None):
+        """Save model, tokenizer, and modeling.py for trust_remote_code loading."""
+        output_dir = output_dir or self.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save model and config
+        self.model.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+
+        # Copy modeling.py for trust_remote_code
+        modeling_src = os.path.join(os.path.dirname(__file__), "modeling.py")
+        modeling_dst = os.path.join(output_dir, "modeling.py")
+        if os.path.exists(modeling_src):
+            shutil.copy(modeling_src, modeling_dst)
+            print(f"Copied modeling.py to {modeling_dst}")
+
+        print(f"Model saved to {output_dir}")
+
+    def train(
+        self,
+        train_data: List[Dict],
+        test_data: List[Dict],
+        eval_data: List[Dict],
+        profile: bool = False,
+    ):
+        """
+        Train the multi-head model.
+
+        Data should have 'labels' as a dict mapping entity types to label sequences.
+        """
+        _eval_data = test_data if len(test_data) > 0 else eval_data
+
+        # Custom trainer that handles multi-head loss computation
+        class MultiHeadHFTrainer(Trainer):
+            def __init__(self, parent_trainer, **kwargs):
+                super().__init__(**kwargs)
+                self.parent_trainer = parent_trainer
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                labels = inputs.pop("labels", None)
+                outputs = model(**inputs, labels=labels)
+
+                if labels is not None:
+                    loss, logits = outputs
+                else:
+                    loss = None
+                    logits = outputs
+
+                return (loss, {"logits": logits}) if return_outputs else loss
+
+            def prediction_step(
+                self, model, inputs, prediction_loss_only, ignore_keys=None
+            ):
+                """Override to handle multi-head decoding."""
+                labels = inputs.pop("labels", None)
+
+                with torch.no_grad():
+                    outputs = model(**inputs, labels=labels)
+
+                    if labels is not None:
+                        loss, logits = outputs
+                    else:
+                        loss = None
+                        logits = outputs
+
+                if prediction_loss_only:
+                    return (loss, None, None)
+
+                # Argmax decoding for each entity type
+                predictions = {}
+                for entity_type in self.parent_trainer.entity_types:
+                    preds = torch.argmax(logits[entity_type], dim=-1)
+                    predictions[entity_type] = preds.cpu()
+
+                # Return labels
+                labels_out = {}
+                if labels is not None:
+                    for entity_type in self.parent_trainer.entity_types:
+                        labels_out[entity_type] = labels[entity_type].cpu()
+
+                return (loss, predictions, labels_out)
+
+            def save_model(self, output_dir=None, _internal_call=False):
+                self.parent_trainer.save_model(output_dir)
+
+        trainer = MultiHeadHFTrainer(
+            parent_trainer=self,
+            model=self.model,
+            args=self.args,
+            train_dataset=train_data,
+            eval_dataset=_eval_data,
+            data_collator=self.data_collator,
+            processing_class=self.tokenizer,
+            compute_metrics=self.compute_metrics,
+        )
+
+        if profile:
+            with torch.profiler.profile(
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler("./log"),
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                trainer.train()
+        else:
+            trainer.train()
+
+        # Evaluate and save metrics
+        metrics = trainer.evaluate(eval_dataset=_eval_data)
+
+        # Save metrics to JSON file
+        metrics_path = os.path.join(self.output_dir, "eval_results.json")
+        os.makedirs(self.output_dir, exist_ok=True)
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Evaluation metrics saved to {metrics_path}")
+
+        # Save model
+        self.model = self.model.to(dtype=torch.bfloat16)
+        try:
+            trainer.save_model(self.output_dir)
+        except Exception as e:
+            print(f"Error saving model: {e}")
+            try:
+                trainer.save_model("output")
+            except Exception as e2:
+                raise ValueError(f"Failed to save model: {e2}")
+
+        torch.cuda.empty_cache()
+        return metrics
