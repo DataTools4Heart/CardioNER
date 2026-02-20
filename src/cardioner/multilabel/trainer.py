@@ -173,7 +173,31 @@ class MultiLabelTokenClassificationModelHF(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.roberta = AutoModel.from_pretrained(config.name_or_path, config=config)
+
+        # Use backbone_model_name if available, fallback to name_or_path
+        # This is critical because name_or_path gets overwritten during save/load
+        backbone_name = getattr(config, "backbone_model_name", None)
+        if backbone_name is None:
+            backbone_name = getattr(config, "name_or_path", None)
+        if backbone_name is None:
+            raise ValueError(
+                "config.backbone_model_name (or config.name_or_path) is required to load pretrained backbone"
+            )
+
+        # Create a clean config for the backbone
+        backbone_config = AutoConfig.from_pretrained(backbone_name)
+        backbone_config.hidden_dropout_prob = getattr(
+            config, "hidden_dropout_prob", 0.1
+        )
+
+        self.roberta = AutoModel.from_pretrained(backbone_name, config=backbone_config)
+
+        # Store backbone_model_name in config for future loading
+        if (
+            not hasattr(config, "backbone_model_name")
+            or config.backbone_model_name is None
+        ):
+            config.backbone_model_name = backbone_name
 
         freeze_backbone = getattr(config, "freeze_backbone", False)
         if freeze_backbone:
@@ -441,6 +465,9 @@ class ModelTrainer:
         if self.class_weights is not None:
             # Ensure all weights are positive
             self.class_weights = torch.abs(self.class_weights)
+            print("Class weights are positive")
+            print(f"Weight: {self.class_weights}")
+            print("#" * 100)
 
         self.label2id = label2id
         self.id2label = id2label
@@ -513,6 +540,9 @@ class ModelTrainer:
         or_config.label2id = self.label2id
         or_config.hidden_dropout_prob = 0.1
         or_config.freeze_backbone = freeze_backbone
+        # Store the original backbone model name for proper loading later
+        # This is critical because name_or_path gets overwritten during save/load
+        or_config.backbone_model_name = model
 
         if isinstance(classifier_hidden_layers, tuple):
             if MultiLabelTokenClassificationModelCustom is None:
@@ -705,6 +735,8 @@ class ModelTrainer:
             def model_init():
                 cfg = copy.deepcopy(self.or_config)
                 cfg.name_or_path = self.model_name_or_path
+                # Ensure backbone_model_name is set (critical for loading saved models)
+                cfg.backbone_model_name = self.model_name_or_path
                 # base_model = AutoModel.from_pretrained(self.model_name_or_path, token=self.hf_token)
                 return MultiLabelTokenClassificationModelCustom(
                     config=cfg,
@@ -721,6 +753,7 @@ class ModelTrainer:
             def model_init():
                 cfg = copy.deepcopy(self.or_config)
                 cfg.name_or_path = self.model_name_or_path
+                cfg.backbone_model_name = self.model_name_or_path
                 return MultiLabelTokenClassificationModelHF.from_config(config=cfg)
 
         if len(test_data) > 0:
