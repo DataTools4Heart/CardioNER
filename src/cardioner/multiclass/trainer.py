@@ -17,18 +17,19 @@ import torch
 from torchcrf import CRF
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForTokenClassification,
     AutoTokenizer,
     DataCollatorForTokenClassification,
     PreTrainedModel,
     RobertaForTokenClassification,
-    RobertaModel,
     Trainer,
     TrainingArguments,
 )
 from transformers.modeling_outputs import TokenClassifierOutput
 from transformers.utils import logging
-from utils import pretty_print_classifier
+
+from cardioner.utils import pretty_print_classifier
 
 # Import custom model classes
 try:
@@ -145,6 +146,10 @@ class ModelTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
+            "fp16": True,
+            "load_best_model_at_end": True,
+            "greater_is_better": True,
+            "metric_for_best_model": "overall_f1",
             "logging_dir": f"{output_dir}/logs",
             "logging_strategy": "steps",
             "logging_steps": 256,
@@ -165,7 +170,7 @@ class ModelTrainer:
                 model,
                 add_prefix_space=True,
                 model_max_length=max_length,
-                padding="max_length",
+                padding=False,
                 truncation=True,
                 token=hf_token,
             )
@@ -176,7 +181,7 @@ class ModelTrainer:
         self.data_collator = CustomDataCollatorForTokenClassification(
             tokenizer=self.tokenizer,
             max_length=max_length,
-            padding="max_length",
+            padding=True,
             label_pad_token_id=self.pad_token_id,
         )
 
@@ -190,6 +195,8 @@ class ModelTrainer:
         or_config.classifier_hidden_layers = classifier_hidden_layers
         or_config.classifier_dropout = classifier_dropout
         or_config.class_weights = class_weights
+        or_config.output_hidden_states = False
+        or_config.output_attentions = False
         # Store the original backbone model name for proper loading later
         # This is critical because name_or_path gets overwritten during save/load
         or_config.backbone_model_name = model
@@ -235,9 +242,13 @@ class ModelTrainer:
                 raise ImportError(
                     "TokenClassificationModel could not be imported. Please ensure modeling.py is available."
                 )
-            self.model = TokenClassificationModel.from_pretrained(
-                model, config=or_config, ignore_mismatched_sizes=True
-            )
+            try:
+                base_model = AutoModel.from_pretrained(
+                    model, config=or_config, add_pooling_layer=False
+                )
+            except TypeError:
+                base_model = AutoModel.from_pretrained(model, config=or_config)
+            self.model = TokenClassificationModel(or_config, base_model=base_model)
 
             # Set up auto_map for trust_remote_code loading
             self.model.config.auto_map = {
@@ -277,23 +288,31 @@ class ModelTrainer:
     def compute_metrics(self, eval_preds):
         logits, labels = eval_preds
         if self.crf:
-            # Following ieeta-pt approach: don't pass mask to CRF decode
-            # All positions have valid labels (O for special/padding tokens)
             crf_device = next(self.model.crf.parameters()).device
             emissions_torch = torch.from_numpy(logits).float().to(crf_device)
-            predictions = self.model.crf.decode(emissions=emissions_torch)
+            labels_torch = torch.from_numpy(labels).to(crf_device)
+            mask = labels_torch != -100
+            predictions = self.model.crf.decode(emissions=emissions_torch, mask=mask)
         else:
             predictions = np.argmax(logits, -1)
 
         # === DEBUG: Check prediction distribution ===
-        pred_flat = np.array(predictions).flatten()
-        label_flat = np.array(labels).flatten()
-        valid_mask = label_flat != -100
+        pred_counts = {label_id: 0 for label_id in self.id2label}
+        true_counts = {label_id: 0 for label_id in self.id2label}
+
+        for pred_seq, label_seq in zip(predictions, labels):
+            for p, l in zip(pred_seq, label_seq):
+                if l == -100:
+                    continue
+                if int(p) in pred_counts:
+                    pred_counts[int(p)] += 1
+                if int(l) in true_counts:
+                    true_counts[int(l)] += 1
 
         print("\n=== Evaluation prediction distribution ===")
         for label_id, label_name in self.id2label.items():
-            pred_count = (pred_flat[valid_mask] == label_id).sum()
-            true_count = (label_flat[valid_mask] == label_id).sum()
+            pred_count = pred_counts.get(label_id, 0)
+            true_count = true_counts.get(label_id, 0)
             print(f"  {label_name}: pred={pred_count}, true={true_count}")
         print("=" * 50 + "\n")
         # === END DEBUG ===
@@ -310,6 +329,8 @@ class ModelTrainer:
             seq_labels = []
             seq_preds = []
             for p, l in zip(prediction, label):
+                if l == -100:
+                    continue
                 label_name = id2label.get(int(l), "O")
                 pred_name = id2label.get(int(p), "O")
 
@@ -443,6 +464,26 @@ class ModelTrainer:
 
                 return (loss, outputs) if return_outputs else loss
 
+            def prediction_step(
+                self, model, inputs, prediction_loss_only, ignore_keys=None
+            ):
+                labels = inputs.get("labels")
+                attention_mask = inputs.get("attention_mask")
+
+                with torch.no_grad():
+                    outputs = model(**inputs)
+
+                if prediction_loss_only:
+                    loss = outputs.loss if hasattr(outputs, "loss") else None
+                    return (loss, None, None)
+
+                logits = outputs.logits
+                if labels is not None and attention_mask is not None:
+                    labels = labels.clone()
+                    labels[attention_mask == 0] = -100
+
+                return (None, logits, labels)
+
             def save_model(self, output_dir=None, _internal_call=False):
                 self.parent_trainer.save_model(output_dir)
 
@@ -498,7 +539,7 @@ class MultiHeadDataCollatorForTokenClassification(DataCollatorForTokenClassifica
         tokenizer,
         entity_types: List[str],
         max_length: int = 512,
-        padding: str = "max_length",
+        padding: str = "longest",
         label_pad_token_id: int = 0,  # Use O label for masked positions (CRF can't handle -100)
     ):
         super().__init__(
@@ -612,6 +653,10 @@ class MultiHeadCRFTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
+            "fp16": True,
+            "load_best_model_at_end": True,
+            "greater_is_better": True,
+            "metric_for_best_model": "overall_f1",
             "logging_dir": f"{output_dir}/logs",
             "logging_strategy": "steps",
             "logging_steps": 256,
@@ -624,7 +669,7 @@ class MultiHeadCRFTrainer:
                 model,
                 add_prefix_space=True,
                 model_max_length=max_length,
-                padding="max_length",
+                padding=False,
                 truncation=True,
                 token=hf_token,
             )
@@ -638,7 +683,7 @@ class MultiHeadCRFTrainer:
             tokenizer=self.tokenizer,
             entity_types=self.entity_types,
             max_length=max_length,
-            padding="max_length",
+            padding=True,
             label_pad_token_id=self.label_pad_token_id,
         )
 
@@ -734,6 +779,8 @@ class MultiHeadCRFTrainer:
                 seq_labels = []
                 seq_preds = []
                 for p, l in zip(pred_seq, label_seq):
+                    if l == -100:
+                        continue
                     label_name = self.id2label.get(int(l), "O")
                     pred_name = self.id2label.get(int(p), "O")
 
@@ -823,6 +870,7 @@ class MultiHeadCRFTrainer:
             ):
                 """Override to handle multi-head CRF decoding."""
                 labels = inputs.pop("labels", None)
+                attention_mask = inputs.get("attention_mask")
 
                 with torch.no_grad():
                     outputs = model(**inputs, labels=labels)
@@ -837,23 +885,28 @@ class MultiHeadCRFTrainer:
                     return (loss, None, None)
 
                 # Decode using CRF for each entity type
-                # Following ieeta-pt: don't pass mask to decode, let CRF decode all positions
                 predictions = {}
                 for entity_type in self.parent_trainer.entity_types:
                     crf = getattr(model, f"{entity_type}_crf")
-                    decoded = crf.decode(logits[entity_type])
+                    if attention_mask is not None:
+                        mask = attention_mask.bool()
+                        decoded = crf.decode(logits[entity_type], mask=mask)
+                    else:
+                        decoded = crf.decode(logits[entity_type])
                     # Pad decoded sequences to same length for batching
                     max_len = max(len(seq) for seq in decoded)
                     padded = [seq + [0] * (max_len - len(seq)) for seq in decoded]
                     # Return as tensor to be compatible with HuggingFace Trainer
                     predictions[entity_type] = torch.tensor(padded)
 
-                # Return labels directly (all positions have valid O/B/I labels)
-                # Keep as tensors for HuggingFace Trainer compatibility
+                # Return labels with padding masked out
                 labels_out = {}
                 if labels is not None:
                     for entity_type in self.parent_trainer.entity_types:
-                        labels_out[entity_type] = labels[entity_type].cpu()
+                        labels_masked = labels[entity_type].clone()
+                        if attention_mask is not None:
+                            labels_masked[attention_mask == 0] = -100
+                        labels_out[entity_type] = labels_masked.cpu()
 
                 return (loss, predictions, labels_out)
 
@@ -961,6 +1014,10 @@ class MultiHeadTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
+            "fp16": True,
+            "load_best_model_at_end": True,
+            "greater_is_better": True,
+            "metric_for_best_model": "overall_f1",
             "logging_dir": f"{output_dir}/logs",
             "logging_strategy": "steps",
             "logging_steps": 256,
@@ -973,7 +1030,7 @@ class MultiHeadTrainer:
                 model,
                 add_prefix_space=True,
                 model_max_length=max_length,
-                padding="max_length",
+                padding=False,
                 truncation=True,
                 token=hf_token,
             )
@@ -987,7 +1044,7 @@ class MultiHeadTrainer:
             tokenizer=self.tokenizer,
             entity_types=self.entity_types,
             max_length=max_length,
-            padding="max_length",
+            padding=True,
             label_pad_token_id=self.label_pad_token_id,
         )
 
@@ -1170,6 +1227,7 @@ class MultiHeadTrainer:
             ):
                 """Override to handle multi-head decoding."""
                 labels = inputs.pop("labels", None)
+                attention_mask = inputs.get("attention_mask")
 
                 with torch.no_grad():
                     outputs = model(**inputs, labels=labels)
@@ -1189,11 +1247,14 @@ class MultiHeadTrainer:
                     preds = torch.argmax(logits[entity_type], dim=-1)
                     predictions[entity_type] = preds.cpu()
 
-                # Return labels
+                # Return labels with padding masked out
                 labels_out = {}
                 if labels is not None:
                     for entity_type in self.parent_trainer.entity_types:
-                        labels_out[entity_type] = labels[entity_type].cpu()
+                        labels_masked = labels[entity_type].clone()
+                        if attention_mask is not None:
+                            labels_masked[attention_mask == 0] = -100
+                        labels_out[entity_type] = labels_masked.cpu()
 
                 return (loss, predictions, labels_out)
 

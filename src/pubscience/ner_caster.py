@@ -1,12 +1,15 @@
 # Source: https://github.com/bramiozo/PubScience/blob/main/pubscience/share/ner_caster.py
 
 import argparse
+import csv
 import json
 import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel
+
+PRUNED_FROM_IDS = ["disease", "procedure", "symptom", "medication"]
 
 
 class TAGS(BaseModel):
@@ -50,7 +53,8 @@ class NERFormer:
     def __init__(
         self,
         ann_dir: str,
-        txt_dir: str,
+        txt_dir: str | None,
+        txt_csv: str | None,
         db_path: str | None,
         out_path: str | None,
         name_map: NameMap | None,
@@ -59,13 +63,20 @@ class NERFormer:
 
         self.ann_dir = ann_dir
         self.txt_dir = txt_dir
+        self.txt_csv = txt_csv
         self.db_path = db_path
         self.out_path = out_path
 
-        # check if (ann_dir exists and txt_dir) or (db_path exists and txt_dir)
+        # check if (ann_dir exists and txt_dir/txt_csv) or (db_path exists and txt_dir/txt_csv)
         # if not raise ValueError
-        if (ann_dir is None and db_path is None) or txt_dir is None:
-            raise ValueError("Please provide a valid ann/db/txt directory")
+        if (ann_dir is None and db_path is None) or (
+            txt_dir is None and txt_csv is None
+        ):
+            raise ValueError("Please provide a valid ann/db/txt directory or text csv")
+
+        if isinstance(txt_csv, str):
+            if not os.path.exists(txt_csv):
+                raise ValueError("Please provide a valid txt_csv")
 
         if isinstance(db_path, str):
             if not os.path.exists(db_path):
@@ -92,41 +103,73 @@ class NERFormer:
         self.write_to_file = write_to_file
         self.name_map = name_map
 
+    def _load_text_csv(self) -> Dict[str, str]:
+        if self.txt_csv is None:
+            return {}
+        text_map: Dict[str, str] = {}
+        with open(self.txt_csv, "r", encoding="utf-8", newline="") as fread:
+            reader = csv.DictReader(fread)
+            if reader.fieldnames is None:
+                raise ValueError(
+                    "txt_csv must contain a header with id and text columns"
+                )
+            if "id" not in reader.fieldnames or "text" not in reader.fieldnames:
+                raise ValueError("txt_csv must contain columns named id and text")
+            for row in reader:
+                if row is None:
+                    continue
+                _id = row.get("id")
+                _text = row.get("text")
+                if _id is None or _text is None:
+                    continue
+                text_map[str(_id)] = str(_text)
+        return text_map
+
     def _text_adder(self, tag_dict: Dict[str, List[TAGS]]) -> List[NER]:
         output_jsonl = []
+        text_map = self._load_text_csv() if self.txt_csv is not None else {}
         for k, v in tag_dict.items():
-            # get the text from the text file
-            file_name = os.path.join(self.txt_dir, f"{k}.txt")
-            with open(file_name, "r", encoding="utf-8") as fread:
-                text = fread.read()
+            if self.txt_csv is not None:
+                if k not in text_map:
+                    raise ValueError(f"Missing text for id {k} in txt_csv")
+                text = text_map[k]
+            else:
+                # get the text from the text file
+                file_name = os.path.join(self.txt_dir, f"{k}.txt")
+                with open(file_name, "r", encoding="utf-8") as fread:
+                    text = fread.read()
             output_jsonl.append(NER(tags=v, id=k, text=text))
         return output_jsonl
 
     def parse_db(self, db_path: str) -> List[NER]:
         # read file
-        # first line contains header with tab-separated names
-        with open(db_path, "r", encoding="utf-8") as fread:
-            lines = fread.readlines()
+        # first line contains header with tab/comma-separated names
+        delimiter = "\t"
+        if db_path.lower().endswith(".csv"):
+            delimiter = ","
+        with open(db_path, "r", encoding="utf-8", newline="") as fread:
+            reader = csv.DictReader(fread, delimiter=delimiter)
 
-        id_str = self.name_map.id
-        tag_str = self.name_map.tag
-        start_str = self.name_map.start
-        end_str = self.name_map.end
+            id_str = self.name_map.id
+            tag_str = self.name_map.tag
+            start_str = self.name_map.start
+            end_str = self.name_map.end
 
-        # get the header
-        # get the index of the text column
-        header = lines[0].strip().split("\t")
-        print(header)
+            header = reader.fieldnames or []
+            print(header)
 
-        res_dict = defaultdict(list)
-        for r in lines[1:]:
-            if r.strip() == "":
-                continue
-            rdict = dict(zip(header, r.strip().split("\t")))
-            TAG = TAGS(
-                start=int(rdict[start_str]), end=int(rdict[end_str]), tag=rdict[tag_str]
-            )
-            res_dict[rdict[id_str]].append(TAG)
+            res_dict = defaultdict(list)
+            for rdict in reader:
+                if not rdict:
+                    continue
+                if all(v is None or str(v).strip() == "" for v in rdict.values()):
+                    continue
+                TAG = TAGS(
+                    start=int(rdict[start_str]),
+                    end=int(rdict[end_str]),
+                    tag=rdict[tag_str],
+                )
+                res_dict[rdict[id_str]].append(TAG)
 
         # second iteration to add the text, we only need to to this once per id
         output_jsonl = self._text_adder(res_dict)
@@ -145,6 +188,8 @@ class NERFormer:
                 # parse the line
                 # example; T1	DISEASE 188 200	ritmestormen
                 # now, id= ann tag = DISEASE, start = 188, end = 200
+                if l.startswith("#"):
+                    continue
                 try:
                     l = l.strip().split("\t")
                     tag = l[1].split(" ")[0]
@@ -165,7 +210,8 @@ class NERFormer:
     def transform(self) -> List[NER] | None:
         # read the list of files in the directory for ann/txt
         #
-        txt_list = os.listdir(self.txt_dir)
+        if self.txt_dir is not None:
+            txt_list = os.listdir(self.txt_dir)
 
         if self.ann_dir is not None:
             ann_list = [f for f in os.listdir(self.ann_dir) if f.endswith(".ann")]
@@ -192,10 +238,12 @@ def collect_jsons(
         "SINTOMA": "SYMPTOM",
         "PROCEDIMIENTO": "PROCEDURE",
     },
+    check_text_match: bool = False,
 ):
     # go through jsonl's and per "id" collect/extend the "tags" lists
     #
     id_tags_map = {}
+    pruned_ids = set()
     for js in os.listdir(jsons_path):
         # load jsonl into list
         if js.endswith(".json"):
@@ -204,9 +252,21 @@ def collect_jsons(
 
             for json_obj in jsonl_list:
                 id = json_obj["id"]
+                for term in PRUNED_FROM_IDS:
+                    id = id.replace(term, "")
+                id = id.replace("--", "-")
                 tags = json_obj["tags"]
                 text = json_obj["text"]
+                if id in pruned_ids:
+                    continue
                 if id in id_tags_map:
+                    if check_text_match and id_tags_map[id]["text"] != text:
+                        print(
+                            f"Text mismatch for id {id}: cannot merge annotations...skipping"
+                        )
+                        del id_tags_map[id]
+                        pruned_ids.add(id)
+                        continue
                     id_tags_map[id]["tags"].extend(tags)
                 else:
                     id_tags_map[id] = {"tags": tags, "text": text}
@@ -250,6 +310,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transform NER data")
     parser.add_argument("--ann_dir", type=str, help="Directory with ann files")
     parser.add_argument("--txt_dir", type=str, help="Directory with txt files")
+    parser.add_argument("--txt_csv", type=str, help="File with texts")
     parser.add_argument(
         "--json_dir", type=str, help="Directory that contains partial annotation json's"
     )
@@ -257,6 +318,11 @@ if __name__ == "__main__":
     parser.add_argument("--out_path", type=str, help="Path to output file")
     parser.add_argument("--name_map", type=str, help="Mapping of column names")
     parser.add_argument("--collect_json", action="store_true")
+    parser.add_argument(
+        "--require_text_match",
+        action="store_true",
+        help="Require identical text when merging ids",
+    )
     parser.add_argument("--write_to_file", action="store_true")
 
     args = parser.parse_args()
@@ -269,6 +335,7 @@ if __name__ == "__main__":
         ner = NERFormer(
             ann_dir=args.ann_dir,
             txt_dir=args.txt_dir,
+            txt_csv=args.txt_csv,
             db_path=args.db_path,
             out_path=args.out_path,
             name_map=name_map,
@@ -276,4 +343,8 @@ if __name__ == "__main__":
         )
         ner.transform()
     else:
-        collect_jsons(args.json_dir, args.out_path)
+        collect_jsons(
+            args.json_dir,
+            args.out_path,
+            check_text_match=args.require_text_match,
+        )

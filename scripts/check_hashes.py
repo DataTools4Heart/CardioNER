@@ -14,9 +14,13 @@ verifies that assumption and reports any mismatches.
 """
 
 import argparse
+import csv
 import hashlib
+import itertools
 import sys
 from pathlib import Path
+
+from rapidfuzz.distance import Levenshtein
 
 LABEL_FOLDERS = ["dis", "med", "proc", "symp"]
 
@@ -36,14 +40,24 @@ def compute_file_hash(
     return h.hexdigest()
 
 
+def read_text(filepath: Path) -> str:
+    """Read a text file with replacement for invalid characters."""
+    return filepath.read_text(encoding="utf-8", errors="replace")
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein distance between two strings."""
+    return Levenshtein.distance(a, b)
+
+
 def collect_hashes(
     folder: Path, subfolders: list[str], algorithm: str, strip: bool = False
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, dict[str, object]]]:
     """Collect hashes for all .txt files in each subfolder.
 
-    Returns a nested dict: {subfolder: {filename: hash}}.
+    Returns a nested dict: {subfolder: {filename: {"hash": str, "path": Path}}}.
     """
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, dict[str, object]]] = {}
     for sub in subfolders:
         txt_dir = folder / sub / "txt"
         if not txt_dir.is_dir():
@@ -51,13 +65,20 @@ def collect_hashes(
             result[sub] = {}
             continue
         result[sub] = {
-            p.name: compute_file_hash(p, algorithm, strip=strip)
+            p.name.replace(sub, ""): {
+                "hash": compute_file_hash(p, algorithm, strip=strip),
+                "path": p,
+            }
             for p in sorted(txt_dir.glob("*.txt"))
         }
     return result
 
 
-def compare_hashes(hashes: dict[str, dict[str, str]], verbose: bool = False) -> int:
+def compare_hashes(
+    hashes: dict[str, dict[str, dict[str, object]]],
+    verbose: bool = False,
+    csv_rows: list[dict[str, object]] | None = None,
+) -> int:
     """Compare hashes across subfolders and report mismatches.
 
     Returns the number of files with issues.
@@ -77,7 +98,9 @@ def compare_hashes(hashes: dict[str, dict[str, str]], verbose: bool = False) -> 
 
     for filename in sorted(all_files):
         present_in = {
-            sub: hashes[sub][filename] for sub in subfolders if filename in hashes[sub]
+            sub: hashes[sub][filename]["hash"]
+            for sub in subfolders
+            if filename in hashes[sub]
         }
         absent_from = [sub for sub in subfolders if filename not in hashes[sub]]
 
@@ -94,11 +117,31 @@ def compare_hashes(hashes: dict[str, dict[str, str]], verbose: bool = False) -> 
         if len(unique_hashes) == 1:
             if verbose:
                 print(f"OK       {filename}  ({list(unique_hashes)[0][:12]}...)")
+            if csv_rows is not None:
+                row: dict[str, object] = {"filename": filename}
+                for left, right in itertools.combinations(subfolders, 2):
+                    row[f"distance_{left}_vs_{right}"] = 0
+                csv_rows.append(row)
         else:
             mismatches += 1
             print(f"MISMATCH {filename}")
             for sub in subfolders:
                 print(f"  {sub:6s} : {present_in[sub]}")
+
+            texts = {
+                sub: read_text(hashes[sub][filename]["path"]) for sub in subfolders
+            }
+            distances: dict[tuple[str, str], int] = {}
+            for left, right in itertools.combinations(subfolders, 2):
+                distance = levenshtein(texts[left], texts[right])
+                distances[(left, right)] = distance
+                print(f"  levenshtein {left} vs {right}: {distance}")
+
+            if csv_rows is not None:
+                row: dict[str, object] = {"filename": filename}
+                for left, right in itertools.combinations(subfolders, 2):
+                    row[f"distance_{left}_vs_{right}"] = distances[(left, right)]
+                csv_rows.append(row)
 
     return mismatches + missing
 
@@ -112,7 +155,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "folder",
+        "--folder",
         type=Path,
         help=(
             "Path to the parent folder that contains the annotation "
@@ -145,6 +188,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Strip leading and trailing whitespace from file contents before hashing.",
     )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        help="Write mismatched file Levenshtein distances to a CSV file.",
+    )
     return parser.parse_args()
 
 
@@ -170,7 +218,18 @@ def main() -> None:
         print(f"  {sub:6s} : {count} file(s)")
     print()
 
-    issues = compare_hashes(hashes, verbose=args.verbose)
+    csv_rows: list[dict[str, object]] | None = [] if args.csv else None
+    issues = compare_hashes(hashes, verbose=args.verbose, csv_rows=csv_rows)
+
+    if args.csv is not None and csv_rows is not None:
+        fieldnames = ["filename"] + [
+            f"distance_{left}_vs_{right}"
+            for left, right in itertools.combinations(args.subfolders, 2)
+        ]
+        with args.csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_rows)
 
     if issues == 0:
         print("\nAll files match across subfolders.")

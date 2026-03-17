@@ -20,9 +20,6 @@ import evaluate
 import pandas as pd
 from datasets import Dataset
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from multiclass.trainer import ModelTrainer as MultiClassModelTrainer
-from multiclass.trainer import MultiHeadCRFTrainer, MultiHeadTrainer
-from multilabel.trainer import ModelTrainer as MultiLabelModelTrainer
 from sklearn.model_selection import GroupKFold, train_test_split
 from sklearn.utils import shuffle
 
@@ -37,6 +34,9 @@ from transformers import (
 )
 
 from cardioner import evaluation, model_merger, parse_performance_json, predictor
+from cardioner.multiclass.trainer import ModelTrainer as MultiClassModelTrainer
+from cardioner.multiclass.trainer import MultiHeadCRFTrainer, MultiHeadTrainer
+from cardioner.multilabel.trainer import ModelTrainer as MultiLabelModelTrainer
 from cardioner.utils import calculate_class_weights, merge_annotations, process_pipe
 
 # Clear any existing CUDA context
@@ -64,7 +64,7 @@ def inference(
     Uses the simple aggregation from the huggingface tokenclassification pipeline
 
     Args:
-        corpus_data: List of documents with 'id' and 'text' fields
+        corpus_data: List of documents with 'id' and 'text' fields, and potentially tagged entities
         model_path: Path to the trained model directory
         output_dir: Directory to save output TSV
         lang: Language code for tokenization
@@ -766,14 +766,14 @@ def prepare(
         )
 
     if multi_class:
-        from multiclass.loader import (
+        from cardioner.multiclass.loader import (
             annotate_corpus_centered,
             annotate_corpus_paragraph,
             annotate_corpus_standard,
             tokenize_and_align_labels,
         )
     else:
-        from multilabel.loader import (
+        from cardioner.multilabel.loader import (
             annotate_corpus_centered,
             annotate_corpus_paragraph,
             annotate_corpus_standard,
@@ -918,7 +918,7 @@ def prepare_multihead(
 
     Each entity type gets its own BIO label sequence.
     """
-    from multiclass.loader import (
+    from cardioner.multiclass.loader import (
         annotate_corpus_multihead,
         annotate_corpus_multihead_centered,
         get_entity_types_from_corpus,
@@ -1027,6 +1027,7 @@ def train(
     tokenized_data_test: List[Dict] | None,
     tokenized_data_validation: List[Dict],
     force_splitter: bool = False,
+    only_first_split: bool = False,
     Model: str = "CLTL/MedRoBERTa.nl",
     Splits: List[Tuple[List[str], List[str]]] | int | None = 5,
     output_dir: str = "../output",
@@ -1063,6 +1064,7 @@ def train(
             tokenized_data_test=tokenized_data_test,
             tokenized_data_validation=tokenized_data_validation,
             force_splitter=force_splitter,
+            only_first_split=only_first_split,
             Model=Model,
             Splits=Splits,
             output_dir=output_dir,
@@ -1168,6 +1170,9 @@ def train(
             ]
 
         print(f"Splitting data into {len(SplitList)} folds")
+        if only_first_split:
+            SplitList = SplitList[:1]
+            print("Only running the first split (only_first_split=True)")
         for k, (train_idx, test_idx) in enumerate(SplitList):
             if multi_class:
                 TrainClass = MultiClassModelTrainer(
@@ -1214,7 +1219,34 @@ def train(
             train_data = [shuffled_data[i] for i in train_idx]
             test_data = [shuffled_data[i] for i in test_idx]
 
-            if (tokenized_data_validation is not None) & (force_splitter == True):
+            fold_output_dir = os.path.join(output_dir, f"fold_{k}")
+            os.makedirs(fold_output_dir, exist_ok=True)
+            split_export = {
+                "train_ids": [d["id"] for d in train_data],
+                "train_gids": [d["gid"] for d in train_data],
+                "test_ids": [d["id"] for d in test_data],
+                "test_gids": [d["gid"] for d in test_data],
+            }
+            if (
+                (tokenized_data_validation is not None)
+                and (len(tokenized_data_validation) > 0)
+                and (force_splitter == True)
+            ):
+                split_export["validation_ids"] = [
+                    d["id"] for d in tokenized_data_validation
+                ]
+                split_export["validation_gids"] = [
+                    d["gid"] for d in tokenized_data_validation
+                ]
+            split_path = os.path.join(fold_output_dir, "split.json")
+            with open(split_path, "w", encoding="utf-8") as fw:
+                json.dump(split_export, fw, indent=2)
+
+            if (
+                (tokenized_data_validation is not None)
+                and (len(tokenized_data_validation) > 0)
+                and (force_splitter == True)
+            ):
                 TrainClass.train(
                     train_data=train_data,
                     test_data=test_data,
@@ -1225,7 +1257,10 @@ def train(
                 TrainClass.train(
                     train_data=train_data,
                     test_data=[],
-                    eval_data=tokenized_data_validation,
+                    eval_data=tokenized_data_validation
+                    if (tokenized_data_validation is not None)
+                    and (len(tokenized_data_validation) > 0)
+                    else test_data,
                     profile=profile,
                 )
         # perform model merger
@@ -1355,6 +1390,7 @@ def train_multihead(
     tokenized_data_test: List[Dict] | None,
     tokenized_data_validation: List[Dict],
     force_splitter: bool = False,
+    only_first_split: bool = False,
     Model: str = "CLTL/MedRoBERTa.nl",
     Splits: List[Tuple[List[str], List[str]]] | int | None = 5,
     output_dir: str = "../output",
@@ -1432,6 +1468,9 @@ def train_multihead(
             ]
 
         print(f"Splitting data into {len(SplitList)} folds")
+        if only_first_split:
+            SplitList = SplitList[:1]
+            print("Only running the first split (only_first_split=True)")
         for k, (train_idx, test_idx) in enumerate(SplitList):
             if use_crf:
                 trainer = MultiHeadCRFTrainer(
@@ -1478,7 +1517,34 @@ def train_multihead(
             train_data = [shuffled_data[i] for i in train_idx]
             test_data = [shuffled_data[i] for i in test_idx]
 
-            if (tokenized_data_validation is not None) & (force_splitter == True):
+            fold_output_dir = os.path.join(output_dir, f"fold_{k}")
+            os.makedirs(fold_output_dir, exist_ok=True)
+            split_export = {
+                "train_ids": [d["id"] for d in train_data],
+                "train_gids": [d["gid"] for d in train_data],
+                "test_ids": [d["id"] for d in test_data],
+                "test_gids": [d["gid"] for d in test_data],
+            }
+            if (
+                (tokenized_data_validation is not None)
+                and (len(tokenized_data_validation) > 0)
+                and (force_splitter == True)
+            ):
+                split_export["validation_ids"] = [
+                    d["id"] for d in tokenized_data_validation
+                ]
+                split_export["validation_gids"] = [
+                    d["gid"] for d in tokenized_data_validation
+                ]
+            split_path = os.path.join(fold_output_dir, "split.json")
+            with open(split_path, "w", encoding="utf-8") as fw:
+                json.dump(split_export, fw, indent=2)
+
+            if (
+                (tokenized_data_validation is not None)
+                and (len(tokenized_data_validation) > 0)
+                and (force_splitter == True)
+            ):
                 trainer.train(
                     train_data=train_data,
                     test_data=test_data,
@@ -1489,7 +1555,10 @@ def train_multihead(
                 trainer.train(
                     train_data=train_data,
                     test_data=[],
-                    eval_data=test_data,
+                    eval_data=tokenized_data_validation
+                    if (tokenized_data_validation is not None)
+                    and (len(tokenized_data_validation) > 0)
+                    else test_data,
                     profile=profile,
                 )
 
@@ -1590,7 +1659,7 @@ if __name__ == "__main__":
         "--lang",
         type=str,
         required=True,
-        choices=["es", "nl", "en", "it", "ro", "sv", "cz"],
+        choices=["es", "nl", "en", "it", "ro", "sv", "cz", "multi"],
     )
     argparsers.add_argument("--corpus_train", type=str, required=False)
     argparsers.add_argument("--corpus_validation", type=str, required=False)
@@ -1624,6 +1693,12 @@ if __name__ == "__main__":
     argparsers.add_argument("--use_crf", action="store_true", default=False)
     argparsers.add_argument("--profile", action="store_true", default=False)
     argparsers.add_argument("--force_splitter", action="store_true", default=False)
+    argparsers.add_argument(
+        "--only_first_split",
+        action="store_true",
+        default=False,
+        help="If using a splitter/cross-validation, run only the first split",
+    )
     argparsers.add_argument("--write_annotations", action="store_true", default=False)
     argparsers.add_argument("--without_iob_tagging", action="store_true", default=False)
     argparsers.add_argument(
@@ -1712,6 +1787,7 @@ if __name__ == "__main__":
     corpus_validation = args.corpus_validation
     split_file = args.split_file
     force_splitter = args.force_splitter
+    only_first_split = args.only_first_split
     _annotation_loc = args.annotation_loc
     parse_annotations = args.parse_annotations
     train_model = args.train_model
@@ -2072,6 +2148,7 @@ if __name__ == "__main__":
             tokenized_data_test,
             tokenized_data_validation,
             force_splitter=force_splitter,
+            only_first_split=only_first_split,
             Model=_model,
             Splits=splits,
             output_dir=OutputDir,

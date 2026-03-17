@@ -17,6 +17,7 @@ from spacy.lang.it import Italian
 from spacy.lang.nl import Dutch
 from spacy.lang.ro import Romanian
 from spacy.lang.sv import Swedish
+from spacy.lang.xx import MultiLanguage
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -28,6 +29,7 @@ lang_dict = {
     "ro": Romanian,
     "sv": Swedish,
     "cz": Czech,
+    "multi": MultiLanguage,
 }
 
 
@@ -55,7 +57,7 @@ def process_pipe(
     max_word_per_chunk: int = 256,
     hf_stride: bool = True,
     batch_size: int = 16,
-    lang: Literal["es", "nl", "en", "it", "ro", "sv", "cz"] = "en",
+    lang: Literal["es", "nl", "en", "it", "ro", "sv", "cz", "multi"] = "en",
 ) -> List[Dict[str, str]] | List[List[Dict[str, str]]]:
     """
     text: The text to process
@@ -66,7 +68,7 @@ def process_pipe(
     batch_size: batch_size in case the input is a Dataset
     hf_stride: use stride that is part of the huggingface pipe
     """
-    assert lang in ["es", "nl", "en", "it", "ro", "sv", "cz"], (
+    assert lang in ["es", "nl", "en", "it", "ro", "sv", "cz", "multi"], (
         f"Language {lang} not supported"
     )
     assert (
@@ -438,7 +440,7 @@ def merge_annotations(
         text = d[text_key]
         id = d[merge_key]
 
-        assert tags is not None, f"Tags should not be none: {id}"
+        #assert tags is not None, f"Tags should not be none: {id}"
 
         NEW_DICT[id][tag_key].extend(tags)
         NEW_DICT[id][text_key].extend([text])
@@ -459,7 +461,11 @@ def merge_annotations(
             )
             continue
 
-        _d = {"id": k, "tags": v[tag_key], "text": list_of_texts[0]}
+        if len(v[tag_key])==0:
+            vt = None
+        else:
+            vt = v[tag_key]
+        _d = {"id": k, "tags": vt, "text": list_of_texts[0]}
         NEW_DICT_LIST.append(_d)
     return NEW_DICT_LIST
 
