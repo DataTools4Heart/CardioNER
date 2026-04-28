@@ -12,12 +12,14 @@ environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple
 
 import evaluate
 import pandas as pd
+import transformers
 from datasets import Dataset
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.model_selection import GroupKFold, train_test_split
@@ -32,6 +34,11 @@ from transformers import (
     AutoTokenizer,
     pipeline,
 )
+
+print(sys.executable)
+print(transformers.__file__)
+print(transformers.__version__)
+
 
 from cardioner import evaluation, model_merger, parse_performance_json, predictor
 from cardioner.multiclass.trainer import ModelTrainer as MultiClassModelTrainer
@@ -57,7 +64,7 @@ def inference(
     strategy: Literal["simple", "average", "first", "max"] = "simple",
     pipe: Literal["dt4h", "hf"] = "hf",
     dt4h_post_hoc_cleaning=True,
-    dt4h_min_confidence=0.6,
+    dt4h_min_confidence=0.65,
     dt4h_batch_size: int = 4,
 ):
     """
@@ -83,11 +90,19 @@ def inference(
     os.makedirs(output_dir, exist_ok=True)
 
     if pipe == "hf":
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code, use_fast=True
+            )
+            print("Using fast tokenizer for inference.")
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code, use_fast=False
+            )
+            print("Fast tokenizer not available; falling back to slow tokenizer.")
+
         # Auto-detect max_word_per_chunk from tokenizer if not provided
         if max_word_per_chunk is None:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_path, trust_remote_code=trust_remote_code
-            )
             max_word_per_chunk = tokenizer.model_max_length // 2
             assert max_word_per_chunk < 10000, (
                 f"Calculated max_word_per_chunk ({max_word_per_chunk}) is >= 10,000. "
@@ -106,7 +121,7 @@ def inference(
             "token-classification",
             stride=max_word_per_chunk,
             model=model_path,
-            tokenizer=model_path,
+            tokenizer=tokenizer,
             aggregation_strategy=strategy,
             trust_remote_code=trust_remote_code,
         )
@@ -159,7 +174,10 @@ def inference(
                 )
     else:
         ner_pipe = predictor.PredictionNER(
-            model_checkpoint=model_path, revision=None, stride=max_word_per_chunk
+            model_checkpoint=model_path,
+            revision=None,
+            stride=max_word_per_chunk,
+            lang=lang,
         )
         pred_results = []
         ref_results = []
@@ -191,6 +209,7 @@ def inference(
                 batch_size=dt4h_batch_size,
                 confidence_threshold=dt4h_min_confidence,
                 post_hoc_cleaning=dt4h_post_hoc_cleaning,
+                trim_trailing_cutoff_words=True,
             )
             if len(res) > 0:
                 for _res in res:
@@ -288,10 +307,17 @@ def inference_multihead_crf(
     output_tsv_path = os.path.join(output_dir, "predictions.tsv")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=trust_remote_code
-    )
+    # Load tokenizer (prefer fast tokenizer, fallback to slow)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=True
+        )
+        print("Using fast tokenizer for inference.")
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=False
+        )
+        print("Fast tokenizer not available; falling back to slow tokenizer.")
 
     # Auto-detect max_word_per_chunk from tokenizer if not provided
     if max_word_per_chunk is None:
@@ -501,10 +527,17 @@ def inference_multihead(
     output_tsv_path = os.path.join(output_dir, "predictions.tsv")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=trust_remote_code
-    )
+    # Load tokenizer (prefer fast tokenizer, fallback to slow)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=True
+        )
+        print("Using fast tokenizer for inference.")
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=False
+        )
+        print("Fast tokenizer not available; falling back to slow tokenizer.")
 
     # Auto-detect max_word_per_chunk from tokenizer if not provided
     if max_word_per_chunk is None:
@@ -750,7 +783,7 @@ def prepare(
 ):
     # Multi-head CRF preparation
     if use_multihead_crf:
-        from multiclass.loader import (
+        from cardioner.multiclass.loader import (
             annotate_corpus_multihead,
             annotate_corpus_multihead_centered,
             get_entity_types_from_corpus,
@@ -786,11 +819,18 @@ def prepare(
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        Model, add_prefix_space=True, token=hf_token
+        Model,
+        add_prefix_space=True,
+        token=hf_token,
+        rust_remote_code=False,
+        force_download=True,
+        local_files_only=False,
     )
     tokenizer.model_max_length = max_length
 
-    model_config = AutoConfig.from_pretrained(Model, token=hf_token, trust_remote_code=True)
+    model_config = AutoConfig.from_pretrained(
+        Model, token=hf_token, trust_remote_code=True
+    )
     max_model_length = model_config.max_position_embeddings  # 514
     num_special_tokens = tokenizer.num_special_tokens_to_add(pair=False)  # 2
     max_allowed_chunk_size = max_model_length - num_special_tokens  # 512
@@ -933,6 +973,9 @@ def prepare_multihead(
         Model,
         add_prefix_space=True,
         token=hf_token,
+        trust_remote_code=False,
+        force_download=True,
+        local_files_only=False,
     )
     tokenizer.model_max_length = max_length
 
