@@ -24,13 +24,13 @@ from transformers import (
     AutoTokenizer,
     DataCollatorForTokenClassification,
     PreTrainedModel,
-    RobertaForTokenClassification,
     Trainer,
     TrainingArguments,
 )
 from transformers.modeling_outputs import TokenClassifierOutput
 from transformers.utils import logging
 
+from cardioner.model_export import export_pruned_modeling_from_auto_map
 from cardioner.utils import pretty_print_classifier
 
 # Import custom model classes
@@ -71,6 +71,39 @@ import evaluate
 from torch import nn
 
 metric = evaluate.load("seqeval")
+
+
+def _cuda_device_usable(device: str = "cuda:0") -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        _ = torch.zeros(1, device=device)
+        return True
+    except Exception as e:
+        print(
+            f"CUDA reported available but '{device}' is unusable: {e}. "
+            "Falling back to CPU."
+        )
+        return False
+
+
+def _configure_mixed_precision(train_kwargs: Dict[str, object]) -> None:
+    cuda_usable = _cuda_device_usable("cuda:0")
+    train_kwargs["use_cpu"] = not cuda_usable
+
+    if not cuda_usable:
+        train_kwargs["bf16"] = False
+        train_kwargs["fp16"] = False
+        print("Mixed precision disabled (CPU mode).")
+        return
+
+    bf16_supported = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    train_kwargs["bf16"] = bf16_supported
+    train_kwargs["fp16"] = not bf16_supported
+    print(
+        f"Mixed precision: {'bf16' if bf16_supported else 'fp16'} "
+        f"(cuda_available={torch.cuda.is_available()}, cuda_usable={cuda_usable})"
+    )
 
 
 class CustomDataCollatorForTokenClassification(DataCollatorForTokenClassification):
@@ -151,7 +184,6 @@ class ModelTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
-            "fp16": True,
             "load_best_model_at_end": True,
             "greater_is_better": True,
             "metric_for_best_model": "overall_f1",
@@ -159,6 +191,7 @@ class ModelTrainer:
             "logging_strategy": "steps",
             "logging_steps": 256,
         }
+        _configure_mixed_precision(self.train_kwargs)
         self.crf = use_crf
 
         if use_crf:
@@ -227,12 +260,21 @@ class ModelTrainer:
                     "TokenClassificationModelCRF could not be imported. Please ensure modeling.py is available."
                 )
             print("USING CRF:", self.crf)
-            base_model = RobertaForTokenClassification.from_pretrained(
-                model,
-                config=or_config,
-                ignore_mismatched_sizes=True,
-                use_safetensors=True,
-            )
+            try:
+                base_model = AutoModel.from_pretrained(
+                    model,
+                    config=or_config,
+                    add_pooling_layer=False,
+                    trust_remote_code=True,
+                    use_safetensors=True,
+                )
+            except TypeError:
+                base_model = AutoModel.from_pretrained(
+                    model,
+                    config=or_config,
+                    trust_remote_code=True,
+                    use_safetensors=True,
+                )
             self.model = TokenClassificationModelCRF(
                 or_config,
                 base_model,
@@ -280,11 +322,13 @@ class ModelTrainer:
 
         # optionally freeze the backbone
         if freeze_backbone:
-            for p in self.model.roberta.parameters():
+            for p in self.model.backbone.parameters():
                 p.requires_grad = False
-            self.model.roberta.eval()
+            self.model.backbone.eval()
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cpu" if self.train_kwargs.get("use_cpu", False) else "cuda:0"
+        )
 
         print("Model:", type(self.model))
         print("Device:", self.device)
@@ -366,7 +410,7 @@ class ModelTrainer:
         """Custom method to save both the model architecture and state dict properly"""
         save_dir = output_dir or self.output_dir
 
-        # Copy the modeling.py file to output_dir for trust_remote_code compatibility
+        # Export a pruned modeling.py file containing only auto_map-referenced classes
         import os
 
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -376,17 +420,12 @@ class ModelTrainer:
         # Ensure output directory exists
         os.makedirs(save_dir, exist_ok=True)
 
-        if os.path.exists(modeling_src):
-            shutil.copyfile(modeling_src, modeling_dst)
-            print(f"Successfully copied modeling.py to {modeling_dst}")
-
-            # Verify the copy was successful
-            if not os.path.exists(modeling_dst):
-                raise ValueError(f"Failed to copy modeling.py to {modeling_dst}")
-        else:
-            raise ValueError(
-                f"modeling.py not found at {modeling_src}. This file is required for custom models with trust_remote_code=True."
-            )
+        export_pruned_modeling_from_auto_map(
+            source_modeling_path=modeling_src,
+            output_modeling_path=modeling_dst,
+            auto_map=getattr(self.model.config, "auto_map", None),
+        )
+        print(f"Successfully exported pruned modeling.py to {modeling_dst}")
 
         # Set model configuration
         self.model.config.architectures = [self.model.__class__.__name__]
@@ -691,7 +730,6 @@ class MultiHeadCRFTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
-            "fp16": True,
             "load_best_model_at_end": True,
             "greater_is_better": True,
             "metric_for_best_model": "macro_f1",
@@ -699,6 +737,7 @@ class MultiHeadCRFTrainer:
             "logging_strategy": "steps",
             "logging_steps": 256,
         }
+        _configure_mixed_precision(self.train_kwargs)
 
         # Load tokenizer
         if tokenizer is None:
@@ -790,7 +829,9 @@ class MultiHeadCRFTrainer:
         }
         self.model.config.architectures = ["TokenClassificationModelMultiHeadCRF"]
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cpu" if self.train_kwargs.get("use_cpu", False) else "cuda:0"
+        )
 
         print("=" * 50)
         print("Multi-Head CRF Model Configuration:")
@@ -820,6 +861,7 @@ class MultiHeadCRFTrainer:
         predictions_dict, labels_dict = eval_preds
 
         all_metrics = {}
+        per_entity_f1 = []
 
         for entity_type in self.entity_types:
             if entity_type not in predictions_dict or entity_type not in labels_dict:
@@ -859,6 +901,13 @@ class MultiHeadCRFTrainer:
                 for key, value in entity_metrics.items():
                     all_metrics[f"{entity_type}_{key}"] = value
 
+                # Track entity-level F1 for model selection
+                per_entity_f1.append(entity_metrics.get("overall_f1", 0.0))
+
+        # Required by TrainingArguments(metric_for_best_model="macro_f1")
+        if per_entity_f1:
+            all_metrics["macro_f1"] = sum(per_entity_f1) / len(per_entity_f1)
+
         return all_metrics
 
     def save_model(self, output_dir=None):
@@ -870,16 +919,17 @@ class MultiHeadCRFTrainer:
         # Ensure output directory exists
         os.makedirs(save_dir, exist_ok=True)
 
-        # Copy modeling.py for trust_remote_code compatibility
+        # Export a pruned modeling.py based on auto_map
         current_dir = os.path.dirname(os.path.abspath(__file__))
         modeling_src = os.path.join(current_dir, "modeling.py")
         modeling_dst = os.path.join(save_dir, "modeling.py")
 
-        if os.path.exists(modeling_src):
-            shutil.copyfile(modeling_src, modeling_dst)
-            print(f"Copied modeling.py to {modeling_dst}")
-        else:
-            raise ValueError(f"modeling.py not found at {modeling_src}")
+        export_pruned_modeling_from_auto_map(
+            source_modeling_path=modeling_src,
+            output_modeling_path=modeling_dst,
+            auto_map=getattr(self.model.config, "auto_map", None),
+        )
+        print(f"Exported pruned modeling.py to {modeling_dst}")
 
         # Save model and tokenizer
         self.model.save_pretrained(save_dir)
@@ -1092,7 +1142,6 @@ class MultiHeadTrainer:
             "save_total_limit": 1,
             "report_to": "tensorboard",
             "use_cpu": False,
-            "fp16": True,
             "load_best_model_at_end": True,
             "greater_is_better": True,
             "metric_for_best_model": "macro_f1",
@@ -1100,6 +1149,7 @@ class MultiHeadTrainer:
             "logging_strategy": "steps",
             "logging_steps": 256,
         }
+        _configure_mixed_precision(self.train_kwargs)
 
         # Load tokenizer
         if tokenizer is None:
@@ -1179,6 +1229,7 @@ class MultiHeadTrainer:
                 config=base_config,
                 token=hf_token,
                 trust_remote_code=True,
+                use_safetensors=True,
             )
         self.model = TokenClassificationModelMultiHead(
             config, base_model, freeze_backbone
@@ -1191,7 +1242,9 @@ class MultiHeadTrainer:
         }
         self.model.config.architectures = ["TokenClassificationModelMultiHead"]
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cpu" if self.train_kwargs.get("use_cpu", False) else "cuda:0"
+        )
 
         print("=" * 50)
         print("Multi-Head Model Configuration (no CRF):")
@@ -1278,12 +1331,15 @@ class MultiHeadTrainer:
         self.model.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
 
-        # Copy modeling.py for trust_remote_code
+        # Export a pruned modeling.py for trust_remote_code
         modeling_src = os.path.join(os.path.dirname(__file__), "modeling.py")
         modeling_dst = os.path.join(output_dir, "modeling.py")
-        if os.path.exists(modeling_src):
-            shutil.copy(modeling_src, modeling_dst)
-            print(f"Copied modeling.py to {modeling_dst}")
+        export_pruned_modeling_from_auto_map(
+            source_modeling_path=modeling_src,
+            output_modeling_path=modeling_dst,
+            auto_map=getattr(self.model.config, "auto_map", None),
+        )
+        print(f"Exported pruned modeling.py to {modeling_dst}")
 
         print(f"Model saved to {output_dir}")
 
